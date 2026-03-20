@@ -10,7 +10,7 @@ on:
       themes:
         description: "Comma-separated themes to build"
         required: false
-        default: "transportation,places,buildings,addresses,base"
+        default: "addresses,places,transportation,base,buildings"
       server_type:
         description: "Hetzner server type (ccx43 = 16 vCPU, 64GB)"
         required: false

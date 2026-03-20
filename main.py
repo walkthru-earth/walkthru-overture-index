@@ -287,7 +287,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build H3 indices from Overture Maps")
     parser.add_argument("--release", default=os.environ.get("OVERTURE_RELEASE", ""))
     parser.add_argument(
-        "--themes", default="transportation,places,buildings,addresses,base"
+        "--themes", default="addresses,places,transportation,base,buildings"
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
