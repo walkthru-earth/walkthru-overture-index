@@ -1,0 +1,95 @@
+name: Build Overture index on Hetzner Cloud
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Overture release version (e.g. 2026-03-18.0)"
+        required: false
+        default: ""
+      themes:
+        description: "Comma-separated themes to build"
+        required: false
+        default: "transportation,places,buildings,addresses,base"
+      server_type:
+        description: "Hetzner server type (ccx43 = 16 vCPU, 64GB)"
+        required: false
+        default: "ccx43"
+
+jobs:
+  # ── 1. Spin up Hetzner Cloud runner ────────────────────────────
+  create-runner:
+    name: Create Hetzner runner
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.create.outputs.label }}
+      server_id: ${{ steps.create.outputs.server_id }}
+    steps:
+      - name: Create runner
+        id: create
+        uses: Cyclenerd/hcloud-github-runner@v1
+        with:
+          mode: create
+          github_token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          server_type: ${{ inputs.server_type }}
+          location: nbg1
+          image: ubuntu-24.04
+
+  # ── 2. Run the index build on Hetzner ─────────────────────────
+  build:
+    name: Build index
+    needs: create-runner
+    runs-on: ${{ needs.create-runner.outputs.label }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Install dependencies
+        run: uv sync --no-dev
+
+      - name: Pre-install DuckDB extensions
+        run: |
+          uv run python -c "
+          import duckdb
+          con = duckdb.connect()
+          con.install_extension('spatial')
+          con.install_extension('httpfs')
+          con.install_extension('h3', repository='community')
+          print('Extensions installed')
+          "
+
+      - name: Run pipeline
+        run: |
+          uv run python main.py \
+            --release "${{ inputs.release }}" \
+            --themes "${{ inputs.themes }}"
+        env:
+          OVERTURE_RELEASE: ${{ inputs.release }}
+          OVERTURE_THEMES: ${{ inputs.themes }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_PREFIX: ${{ secrets.S3_PREFIX }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+
+  # ── 3. Always tear down the runner ────────────────────────────
+  delete-runner:
+    name: Delete Hetzner runner
+    needs:
+      - create-runner
+      - build
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    steps:
+      - name: Delete runner
+        uses: Cyclenerd/hcloud-github-runner@v1
+        with:
+          mode: delete
+          github_token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+          name: ${{ needs.create-runner.outputs.label }}
+          server_id: ${{ needs.create-runner.outputs.server_id }}

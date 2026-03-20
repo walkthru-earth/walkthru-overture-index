@@ -1,0 +1,68 @@
+name: Detect new Overture Maps release
+
+on:
+  schedule:
+    # Overture releases ~monthly; check daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Force pipeline run even if no new release"
+        type: boolean
+        default: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check latest Overture release via STAC
+        id: check
+        run: |
+          LATEST=$(curl -s https://labs.overturemaps.org/stac/catalog.json \
+            | python3 -c "
+          import json, sys
+          cat = json.load(sys.stdin)
+          for link in cat.get('links', []):
+              if link.get('rel') == 'child' and 'latest' in link.get('title', '').lower():
+                  print(link['href'].split('/')[1])
+                  break
+          ")
+
+          LAST=$(cat state/last-release.txt 2>/dev/null | tr -d '[:space:]')
+          echo "Latest:    $LATEST"
+          echo "Last seen: $LAST"
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+
+          if [ "$LAST" = "$LATEST" ] && [ "${{ inputs.force_run }}" != "true" ]; then
+            echo "new=false" >> $GITHUB_OUTPUT
+            echo "No new release."
+          else
+            echo "new=true" >> $GITHUB_OUTPUT
+            echo "New release detected!"
+          fi
+
+      - name: Update state file
+        if: steps.check.outputs.new == 'true'
+        run: |
+          echo "${{ steps.check.outputs.latest }}" > state/last-release.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/last-release.txt
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: update Overture last-seen to ${{ steps.check.outputs.latest }} [skip ci]"
+          git push
+
+      - name: Trigger build pipeline
+        if: steps.check.outputs.new == 'true'
+        run: |
+          gh workflow run build-index.yml \
+            --field release="${{ steps.check.outputs.latest }}" \
+            --field themes="transportation"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

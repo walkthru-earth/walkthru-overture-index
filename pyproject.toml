@@ -1,0 +1,16 @@
+[project]
+name = "walkthru-overture-index"
+version = "0.1.0"
+description = "H3-indexed global indices from Overture Maps (transportation, buildings, etc.)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.42.73",
+    "duckdb==1.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.1",
+    "ruff>=0.15.7",
+]
