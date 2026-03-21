@@ -50,7 +50,7 @@ CREATE SECRET output_s3 (TYPE S3, KEY_ID '...', SECRET '...', REGION 'us-west-2'
 - **Set `HOME: /root`** as a job-level env var. Self-hosted runners run as root with no HOME set — DuckDB and uv both need it.
 - **Use `astral-sh/setup-uv@v7`**, not `curl | sh` for uv installation.
 - **Name servers** with a pattern: `overture-{server_type}-{run_id}` for easy identification in the Hetzner dashboard.
-- The `PERSONAL_ACCESS_TOKEN` must be a valid GitHub PAT (not a Hetzner token). Double-check — a typo like `agithub_pat_` vs `github_pat_` causes silent 401s.
+- The `PERSONAL_ACCESS_TOKEN` must be a valid GitHub PAT (not a Hetzner token).
 
 ### Pipeline design
 
