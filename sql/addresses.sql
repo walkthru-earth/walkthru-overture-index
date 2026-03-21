@@ -5,7 +5,7 @@
 -- Grid:   H3 hexagonal cells, resolutions 1–10
 --
 -- Address density is one of the strongest urbanization proxies:
--- high density = dense urban; sparse = rural/undeveloped.
+-- high density = dense urban, sparse = rural/undeveloped.
 -- ============================================================
 
 .print '>>> Step 1: Overture addresses → res 10...'
@@ -34,7 +34,7 @@ SELECT
     h3_cell_to_parent(h3_index, tgt_res) AS h3_index,
     sum(address_count)::INTEGER AS address_count,
     sum(unique_postcodes)::INTEGER AS unique_postcodes
-FROM src_tbl GROUP BY 1;
+FROM query_table(src_tbl) GROUP BY 1;
 
 .print '>>> Rolling up res 9...'
 CREATE OR REPLACE TABLE h3_res9 AS FROM _addr_rollup(h3_res10, 9);

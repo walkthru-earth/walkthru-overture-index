@@ -119,7 +119,7 @@ SELECT
          THEN (sum(avg_floors * n_with_floors) / sum(n_with_floors))::FLOAT
          ELSE NULL END AS avg_floors,
     max(max_floors)::INTEGER AS max_floors
-FROM src_tbl GROUP BY 1;
+FROM query_table(src_tbl) GROUP BY 1;
 
 .print '>>> Rolling up res 9...'
 CREATE OR REPLACE TABLE h3_res9 AS FROM _buildings_rollup(h3_res10, 9);

@@ -134,7 +134,7 @@ SELECT
     sum(n_link)::INTEGER AS n_link,
     sum(n_paved)::INTEGER AS n_paved,
     sum(n_unpaved)::INTEGER AS n_unpaved
-FROM src_tbl
+FROM query_table(src_tbl)
 GROUP BY 1;
 
 -- Res 9

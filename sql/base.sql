@@ -188,7 +188,7 @@ SELECT
     sum(n_canal)::INTEGER AS n_canal, sum(n_pond)::INTEGER AS n_pond,
     sum(n_reservoir)::INTEGER AS n_reservoir, sum(n_spring)::INTEGER AS n_spring,
     sum(n_salt_water)::INTEGER AS n_salt_water, sum(n_intermittent)::INTEGER AS n_intermittent
-FROM src_tbl GROUP BY 1;
+FROM query_table(src_tbl) GROUP BY 1;
 
 .print '>>> Rolling up res 9...'
 CREATE OR REPLACE TABLE h3_res9 AS FROM _base_rollup(h3_res10, 9);

@@ -111,7 +111,7 @@ SELECT
     sum(n_park)::INTEGER AS n_park,
     sum(n_hospital)::INTEGER AS n_hospital,
     sum(n_school)::INTEGER AS n_school
-FROM src_tbl GROUP BY 1;
+FROM query_table(src_tbl) GROUP BY 1;
 
 .print '>>> Rolling up res 9...'
 CREATE OR REPLACE TABLE h3_res9 AS FROM _places_rollup(h3_res10, 9);
