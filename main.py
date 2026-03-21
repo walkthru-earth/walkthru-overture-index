@@ -190,30 +190,41 @@ def run_sql(con: duckdb.DuckDBPyConnection, sql_file: str, theme: str) -> None:
     """Execute a SQL script, splitting on semicolons, with progress logging."""
     sql = Path(sql_file).read_text()
     statements = sql.split(";")
-    total_stmts = len(
-        [s for s in statements if s.strip() and not s.strip().startswith("--")]
-    )
+
+    def _has_sql(raw: str) -> bool:
+        """Check if a semicolon-delimited chunk contains actual SQL."""
+        for line in raw.strip().split("\n"):
+            s = line.strip()
+            if s and not s.startswith("--") and not s.startswith(".print"):
+                return True
+        return False
+
+    total_stmts = len([s for s in statements if _has_sql(s)])
 
     log.info("[SQL] Executing %s (%d statements)", sql_file, total_stmts)
     stmt_num = 0
 
     for stmt in statements:
         stmt = stmt.strip()
-        if not stmt or stmt.startswith("--"):
+        if not stmt:
             continue
 
-        # Handle .print directives
+        # Strip leading comment lines and .print directives
         lines = stmt.split("\n")
         sql_lines = []
         for line in lines:
-            if line.strip().startswith(".print"):
-                msg = line.strip().removeprefix(".print").strip().strip("'\"")
+            stripped = line.strip()
+            if stripped.startswith(".print"):
+                msg = stripped.removeprefix(".print").strip().strip("'\"")
                 log.info("[%s] %s", theme.upper(), msg)
+            elif stripped.startswith("--") and not sql_lines:
+                # Skip leading comment lines (before any SQL)
+                continue
             else:
                 sql_lines.append(line)
 
         stmt = "\n".join(sql_lines).strip()
-        if not stmt:
+        if not stmt or stmt.startswith("--"):
             continue
 
         stmt_num += 1
