@@ -127,6 +127,25 @@ def get_duckdb() -> duckdb.DuckDBPyConnection:
 
     con.sql("SET preserve_insertion_order = false")
     con.sql("SET temp_directory = 'duckdb_temp.tmp'")
+
+    # Memory management: cap at 80% of system RAM so OS keeps enough
+    # for networking, DNS, page cache. DuckDB spills to temp_directory.
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal"):
+                    total_gb = int(line.split()[1]) / 1e6
+                    limit_gb = max(4, int(total_gb * 0.75))
+                    con.sql(f"SET memory_limit = '{limit_gb}GB'")
+                    log.info(
+                        "[DUCKDB] memory_limit = %dGB (of %.1fGB total)",
+                        limit_gb,
+                        total_gb,
+                    )
+                    break
+    except FileNotFoundError:
+        log.info("[DUCKDB] memory_limit = default (not Linux)")
+
     log.info("[DUCKDB] Performance settings applied")
 
     for ext in ("spatial", "httpfs"):
