@@ -239,7 +239,7 @@ def run_sql(con: duckdb.DuckDBPyConnection, sql_file: str, theme: str) -> None:
         if not stmt:
             continue
 
-        # Strip leading comment lines and .print directives
+        # Strip .print directives and leading blank/comment lines
         lines = stmt.split("\n")
         sql_lines = []
         for line in lines:
@@ -247,14 +247,14 @@ def run_sql(con: duckdb.DuckDBPyConnection, sql_file: str, theme: str) -> None:
             if stripped.startswith(".print"):
                 msg = stripped.removeprefix(".print").strip().strip("'\"")
                 log.info("[%s] %s", theme.upper(), msg)
-            elif stripped.startswith("--") and not sql_lines:
-                # Skip leading comment lines (before any SQL)
+            elif not sql_lines and (not stripped or stripped.startswith("--")):
+                # Skip leading blank lines and comments (before any SQL)
                 continue
             else:
                 sql_lines.append(line)
 
         stmt = "\n".join(sql_lines).strip()
-        if not stmt or stmt.startswith("--"):
+        if not stmt:
             continue
 
         stmt_num += 1
