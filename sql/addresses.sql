@@ -14,7 +14,7 @@ CREATE OR REPLACE TABLE h3_res10 AS
 SELECT
     h3_latlng_to_cell(ST_Y(geometry), ST_X(geometry), 10) AS h3_index,
     count(*)::INTEGER AS address_count,
-    count(DISTINCT postal_code) FILTER (postal_code IS NOT NULL)::INTEGER AS unique_postcodes,
+    count(DISTINCT postcode) FILTER (postcode IS NOT NULL)::INTEGER AS unique_postcodes,
 FROM read_parquet(
     getvariable('overture_source') || '/theme=addresses/type=address/*',
     hive_partitioning=0

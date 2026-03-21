@@ -162,23 +162,10 @@ COPY (SELECT h3_index, place_count, (confidence_sum/place_count)::DECIMAL(4,3) A
 DROP TABLE h3_res3;
 
 .print '>>> Rolling up res 1...'
-COPY (SELECT h3_index, sum(place_count)::INTEGER AS place_count, (sum(confidence_sum)/sum(place_count))::DECIMAL(4,3) AS avg_confidence,
-    sum(n_food_and_drink)::INTEGER AS n_food_and_drink, sum(n_shopping)::INTEGER AS n_shopping,
-    sum(n_services_and_business)::INTEGER AS n_services_and_business, sum(n_health_care)::INTEGER AS n_health_care,
-    sum(n_travel_and_transportation)::INTEGER AS n_travel_and_transportation, sum(n_lifestyle_services)::INTEGER AS n_lifestyle_services,
-    sum(n_education)::INTEGER AS n_education, sum(n_community_and_government)::INTEGER AS n_community_and_government,
-    sum(n_cultural_and_historic)::INTEGER AS n_cultural_and_historic, sum(n_sports_and_recreation)::INTEGER AS n_sports_and_recreation,
-    sum(n_lodging)::INTEGER AS n_lodging, sum(n_arts_and_entertainment)::INTEGER AS n_arts_and_entertainment,
-    sum(n_geographic_entities)::INTEGER AS n_geographic_entities,
-    sum(n_restaurant)::INTEGER AS n_restaurant, sum(n_beauty_salon)::INTEGER AS n_beauty_salon,
-    sum(n_hotel)::INTEGER AS n_hotel, sum(n_grocery_store)::INTEGER AS n_grocery_store,
-    sum(n_cafe)::INTEGER AS n_cafe, sum(n_coffee_shop)::INTEGER AS n_coffee_shop,
-    sum(n_bar)::INTEGER AS n_bar, sum(n_pharmacy)::INTEGER AS n_pharmacy,
-    sum(n_gas_station)::INTEGER AS n_gas_station, sum(n_fast_food_restaurant)::INTEGER AS n_fast_food_restaurant,
-    sum(n_bakery)::INTEGER AS n_bakery, sum(n_gym_or_fitness_center)::INTEGER AS n_gym_or_fitness_center,
-    sum(n_park)::INTEGER AS n_park, sum(n_hospital)::INTEGER AS n_hospital, sum(n_school)::INTEGER AS n_school
-  FROM h3_res2 GROUP BY h3_cell_to_parent(h3_index, 1) ORDER BY 1
-) TO (getvariable('output_dir') || '/h3_res=1/data.parquet') (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 1000000);
+CREATE OR REPLACE TABLE h3_res1 AS FROM _places_rollup('h3_res2', 1);
+COPY (SELECT h3_index, place_count, (confidence_sum/place_count)::DECIMAL(4,3) AS avg_confidence, * EXCLUDE (h3_index, place_count, confidence_sum) FROM h3_res1 ORDER BY h3_index)
+  TO (getvariable('output_dir') || '/h3_res=1/data.parquet') (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 1000000);
 DROP TABLE h3_res2;
+DROP TABLE h3_res1;
 
 .print '>>> ALL 10 RESOLUTIONS COMPLETE'
