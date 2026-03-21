@@ -75,39 +75,6 @@ walkthru-earth/indices/
 
 ## Index Schemas
 
-### Transportation (27 columns)
-
-| Column | Description |
-|--------|-------------|
-| `h3_index` | H3 cell ID (BIGINT) |
-| `segment_count` | Total road/rail/water segments |
-| `n_road`, `n_rail`, `n_water` | By subtype |
-| `n_motorway` .. `n_bridleway`, `n_class_unknown` | 18 road classes |
-| `n_bridge`, `n_tunnel`, `n_link` | Road flags |
-| `n_paved`, `n_unpaved` | Surface type |
-
-### Places (30 columns)
-
-| Column | Description |
-|--------|-------------|
-| `h3_index` | H3 cell ID (BIGINT) |
-| `place_count` | Total POIs |
-| `avg_confidence` | Weighted average confidence (0-1) |
-| `n_food_and_drink` .. `n_geographic_entities` | 13 top categories |
-| `n_restaurant` .. `n_school` | 15 subcategories |
-
-### Buildings (40 columns)
-
-| Column | Description |
-|--------|-------------|
-| `h3_index` | H3 cell ID (BIGINT) |
-| `building_count` | Total buildings |
-| `n_residential` .. `n_outbuilding` | 13 subtypes |
-| `n_house` .. `n_hangar` | 20 detailed classes |
-| `n_has_parts` | Complex buildings |
-| `avg_height_m`, `max_height_m` | Height stats |
-| `avg_floors`, `max_floors` | Floor stats |
-
 ### Addresses (3 columns)
 
 | Column | Description |
@@ -116,18 +83,51 @@ walkthru-earth/indices/
 | `address_count` | Total addresses |
 | `unique_postcodes` | Distinct postal codes |
 
-### Base Environment (41 columns)
+### Places (31 columns)
+
+| Column | Description |
+|--------|-------------|
+| `h3_index` | H3 cell ID (BIGINT) |
+| `place_count` | Total POIs |
+| `avg_confidence` | Weighted average confidence (0-1) |
+| `n_food_and_drink` .. `n_geographic_entities` | 13 top categories (from `taxonomy.hierarchy[1]`) |
+| `n_restaurant` .. `n_school` | 15 subcategories (from `categories.primary`) |
+
+### Transportation (27 columns)
+
+| Column | Description |
+|--------|-------------|
+| `h3_index` | H3 cell ID (BIGINT) |
+| `segment_count` | Total road/rail/water segments |
+| `n_road`, `n_rail`, `n_water` | By subtype |
+| `n_motorway` .. `n_bridleway`, `n_class_unknown` | 17 road classes |
+| `n_bridge`, `n_tunnel`, `n_link` | Road flags |
+| `n_paved`, `n_unpaved` | Surface type |
+
+### Base Environment (42 columns)
 
 | Column | Description |
 |--------|-------------|
 | `h3_index` | H3 cell ID (BIGINT) |
 | `infra_count` | Total infrastructure features |
-| `n_power` .. `n_waste_mgmt` | 13 infrastructure subtypes |
+| `n_power` .. `n_communication` | 14 infrastructure subtypes |
 | `landuse_count` | Total land use features |
-| `n_lu_residential` .. `n_lu_resource` | 16 land use subtypes |
+| `n_lu_agriculture` .. `n_lu_protected` | 15 land use subtypes |
 | `water_count` | Total water features |
 | `n_river` .. `n_spring` | 8 water subtypes |
 | `n_salt_water`, `n_intermittent` | Water properties |
+
+### Buildings (42 columns)
+
+| Column | Description |
+|--------|-------------|
+| `h3_index` | H3 cell ID (BIGINT) |
+| `building_count` | Total buildings |
+| `n_residential` .. `n_outbuilding` | 13 subtypes |
+| `n_house` .. `n_hangar` | 20 detailed classes |
+| `n_has_parts` | Complex buildings |
+| `n_with_height`, `avg_height_m`, `max_height_m` | Height stats |
+| `n_with_floors`, `avg_floors`, `max_floors` | Floor stats |
 
 ## Cross-Index Joins
 

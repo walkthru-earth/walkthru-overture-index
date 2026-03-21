@@ -12,11 +12,11 @@ Reads Overture Maps GeoParquet directly from S3 via DuckDB 1.5, builds H3-indexe
 
 | Index | Source | Rows | Key metrics |
 |-------|--------|------|-------------|
-| **Transportation** | segments | ~343M | Road class breakdown (motorway/primary/residential/...), bridges, tunnels, surface type, rail/water |
-| **Places** | places | ~73M | 13 top categories (food, shopping, health, education...), 15 subcategories, confidence |
-| **Buildings** | buildings | ~2.3B | 13 subtypes (residential/commercial/industrial/...), 20 classes, height/floor stats |
-| **Addresses** | addresses | ~200M+ | Address count, unique postcodes per cell |
-| **Base** | infrastructure + land_use + water | ~100M+ | Power/telecom/transit infrastructure, 16 land use types, water bodies |
+| **Addresses** | addresses | ~470M | Address count, unique postcodes per cell (3 cols) |
+| **Places** | places | ~73M | 13 top categories via taxonomy, 15 subcategories, confidence (31 cols) |
+| **Transportation** | segments | ~343M | 17 road classes, bridges/tunnels/surface, rail/water (27 cols) |
+| **Base** | infrastructure + land_use + water | ~140M H3 cells | 14 infra + 15 land use + 8 water subtypes (42 cols) |
+| **Buildings** | buildings | ~2.3B | 13 subtypes, 20 classes, height/floor stats (42 cols) |
 
 ### Complements existing indices
 
@@ -62,7 +62,7 @@ All files: Parquet v2, ZSTD compression, sorted by `h3_index` (BIGINT), no geome
 Two GitHub Actions workflows:
 
 1. **detect-release.yml** — Polls Overture STAC catalog daily. On new release, triggers the build.
-2. **build-index.yml** — Spins up a Hetzner Cloud `ccx43` (16 vCPU, 64 GB RAM), runs all 5 indices sequentially (~3-4 hours), tears down. Cost: ~€0.64 per run.
+2. **build-index.yml** — Spins up a Hetzner Cloud runner (default `ccx63`: 48 vCPU, 192 GB RAM), runs all 5 indices sequentially (~30 min), tears down.
 
 ### Secrets needed
 
