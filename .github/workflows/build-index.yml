@@ -12,9 +12,9 @@ on:
         required: false
         default: "addresses,places,transportation,base,buildings"
       server_type:
-        description: "Hetzner server type (ccx43 = 16 vCPU, 64GB)"
+        description: "Hetzner server type (ccx43=16CPU/64GB, ccx53=32CPU/128GB, ccx63=48CPU/192GB)"
         required: false
-        default: "ccx43"
+        default: "ccx63"
 
 jobs:
   # ── 1. Spin up Hetzner Cloud runner ────────────────────────────
