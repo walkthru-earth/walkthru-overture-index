@@ -146,9 +146,20 @@ def get_duckdb() -> duckdb.DuckDBPyConnection:
         con.load_extension("h3")
     log.info("[DUCKDB] Extension 'h3' loaded")
 
-    # Overture source bucket (public, unsigned)
-    con.sql(f"SET s3_region='{OVERTURE_REGION}'")
-    log.info("[DUCKDB] S3 region set to %s (Overture source)", OVERTURE_REGION)
+    # Overture source bucket (public, anonymous — explicit empty credentials
+    # override AWS env vars that DuckDB httpfs auto-detects)
+    con.sql(f"""
+        CREATE OR REPLACE SECRET overture_s3 (
+            TYPE S3,
+            KEY_ID '',
+            SECRET '',
+            REGION '{OVERTURE_REGION}',
+            SCOPE 's3://overturemaps-{OVERTURE_REGION}'
+        )
+    """)
+    log.info(
+        "[DUCKDB] Anonymous S3 secret for Overture bucket (region=%s)", OVERTURE_REGION
+    )
 
     return con
 
