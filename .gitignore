@@ -5,3 +5,4 @@ output/
 duckdb_temp.tmp/
 .env
 docs/
+_study/

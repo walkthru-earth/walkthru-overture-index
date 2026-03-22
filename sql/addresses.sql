@@ -31,6 +31,8 @@
 --   manifest.parquet       (per-country stats)
 --   tile_index.parquet     (per-h3_parent tile stats)
 --   postcode_index.parquet (postcode → tile mapping)
+--   region_index.parquet   (region → tile mapping)
+--   city_index.parquet     (city → tile mapping)
 --
 -- Cloud-native query flows:
 --
@@ -42,8 +44,11 @@
 --     5. ORDER BY ST_Distance_Sphere(geometry, query_point)
 --
 --   Forward geocode (text → point):
---     1. Parse query → extract country, postcode
---     2. Lookup postcode_index → get 1-3 h3_parent tiles
+--     1. Parse query → detect type (postcode, region, city, address)
+--     2a. Postcode: postcode_index → 1-3 tiles (~fastest)
+--     2b. Region:   region_index → 5-50 tiles (+ bbox filter)
+--     2c. City:     city_index → 1-5 tiles
+--     2d. Address:  tile_index → filter by bbox/region
 --     3. Fetch those tile files (~1-15 MB each)
 --     4. FTS/BM25 on full_address or JACCARD fallback
 --
@@ -53,6 +58,7 @@
 --   - full_address constructed for text search
 --   - h3_index (res 5) + h3_parent (res 4) for spatial tiling
 --   - bbox/sources/address_levels dropped (~30% smaller)
+--   - h3_index stored as hex string (no h3 extension needed)
 -- ============================================================
 
 -- ----------------------------------------------------------
@@ -88,7 +94,10 @@ WITH raw AS (
 ),
 with_city_region AS (
     SELECT
-        id, geometry, country, postcode, street, number, unit, h3_index,
+        id, geometry, country, postcode, street, number, unit,
+        -- Convert H3 BIGINT to hex string so WASM consumers
+        -- don't need the h3 extension to read the value
+        h3_h3_to_string(h3_index) AS h3_index,
         -- H3 res 4 parent for file-level partitioning (~1,770 km² per cell)
         h3_h3_to_string(h3_cell_to_parent(h3_index, 4)) AS h3_parent,
         -- City: finest administrative level (country-aware)
@@ -122,8 +131,18 @@ with_city_region AS (
 SELECT
     id, geometry, country, postcode, street, number, unit,
     city, region,
+    -- Country-aware address formatting:
+    -- Street-first: DE, FR, IT, NL, AT, CH, ES, PT, BE, LU, NO, SE,
+    --               FI, DK, IS, PL, CZ, SK, SI, HR, RS, EE, LV, LT
+    -- Number-first: US, CA, AU, NZ, GB, IE, BR, MX, CL, CO, UY, SG
     CONCAT_WS(', ',
-        NULLIF(TRIM(COALESCE(number, '') || ' ' || COALESCE(street, '')), ''),
+        NULLIF(TRIM(
+            CASE
+                WHEN country IN ('US','CA','AU','NZ','BR','MX','CL','CO','UY','SG','HK','TW')
+                    THEN COALESCE(number, '') || ' ' || COALESCE(street, '')
+                ELSE COALESCE(street, '') || ' ' || COALESCE(number, '')
+            END
+        ), ''),
         city,
         region,
         postcode
@@ -156,8 +175,8 @@ FROM _enriched;
 -- With ~4,000-6,000 h3_parent partitions across 39 countries,
 -- DuckDB needs to flush and reopen files frequently. Raising
 -- this reduces write overhead at the cost of more memory.
--- On a 64 GB build machine, 500 is safe.
-SET partitioned_write_max_open_files = 500;
+-- On the 190 GB build machine, 1000 is safe.
+SET partitioned_write_max_open_files = 1000;
 
 COPY (
     SELECT
@@ -183,18 +202,36 @@ COPY (
 .print '>>> Step 3: Computing tile statistics...'
 
 CREATE OR REPLACE TABLE _tile_stats AS
+WITH tile_agg AS (
+    SELECT
+        country,
+        h3_parent,
+        count(*)::INTEGER AS address_count,
+        min(ST_X(geometry)) AS bbox_min_lon,
+        max(ST_X(geometry)) AS bbox_max_lon,
+        min(ST_Y(geometry)) AS bbox_min_lat,
+        max(ST_Y(geometry)) AS bbox_max_lat,
+        count(DISTINCT postcode) FILTER (postcode IS NOT NULL)::INTEGER AS unique_postcodes,
+        count(DISTINCT city) FILTER (city IS NOT NULL)::INTEGER AS unique_cities
+    FROM _enriched
+    GROUP BY country, h3_parent
+),
+-- Dominant region per tile (most addresses wins)
+tile_regions AS (
+    SELECT
+        country, h3_parent, region,
+        count(*) AS region_count,
+        ROW_NUMBER() OVER (PARTITION BY country, h3_parent ORDER BY count(*) DESC) AS rn
+    FROM _enriched
+    WHERE region IS NOT NULL
+    GROUP BY country, h3_parent, region
+)
 SELECT
-    country,
-    h3_parent,
-    count(*)::INTEGER AS address_count,
-    min(ST_X(geometry)) AS bbox_min_lon,
-    max(ST_X(geometry)) AS bbox_max_lon,
-    min(ST_Y(geometry)) AS bbox_min_lat,
-    max(ST_Y(geometry)) AS bbox_max_lat,
-    count(DISTINCT postcode) FILTER (postcode IS NOT NULL)::INTEGER AS unique_postcodes,
-    count(DISTINCT city) FILTER (city IS NOT NULL)::INTEGER AS unique_cities
-FROM _enriched
-GROUP BY country, h3_parent;
+    t.*,
+    r.region AS primary_region
+FROM tile_agg t
+LEFT JOIN tile_regions r
+    ON t.country = r.country AND t.h3_parent = r.h3_parent AND r.rn = 1;
 
 SELECT
     count(*) AS total_tiles,
@@ -266,10 +303,59 @@ COPY (
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
 -- ----------------------------------------------------------
--- Step 7: Cleanup
+-- Step 7: Export region index (for forward geocoding)
+-- ----------------------------------------------------------
+-- Maps each region to the h3_parent tile(s) containing it.
+-- Enables "search California" → jump to the right tiles.
+-- Most regions span 5-50 tiles. ~500 regions globally.
+
+.print '>>> Step 7: Building region index...'
+
+COPY (
+    SELECT
+        country,
+        region,
+        list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
+        count(*)::INTEGER AS addr_count,
+        min(ST_X(geometry)) AS bbox_min_lon,
+        max(ST_X(geometry)) AS bbox_max_lon,
+        min(ST_Y(geometry)) AS bbox_min_lat,
+        max(ST_Y(geometry)) AS bbox_max_lat
+    FROM _enriched
+    WHERE region IS NOT NULL
+    GROUP BY country, region
+    ORDER BY country, region
+) TO (getvariable('output_dir') || '/region_index.parquet')
+(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
+
+-- ----------------------------------------------------------
+-- Step 8: Export city index (for forward geocoding)
+-- ----------------------------------------------------------
+-- Maps each city to the h3_parent tile(s) containing it.
+-- Enables "search Amsterdam" → jump to 1-5 tiles.
+-- Most cities fit in 1-3 tiles. ~50K cities globally.
+
+.print '>>> Step 8: Building city index...'
+
+COPY (
+    SELECT
+        country,
+        region,
+        city,
+        list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
+        count(*)::INTEGER AS addr_count
+    FROM _enriched
+    WHERE city IS NOT NULL
+    GROUP BY country, region, city
+    ORDER BY country, city
+) TO (getvariable('output_dir') || '/city_index.parquet')
+(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
+
+-- ----------------------------------------------------------
+-- Step 9: Cleanup
 -- ----------------------------------------------------------
 
-.print '>>> Step 7: Cleanup...'
+.print '>>> Step 9: Cleanup...'
 DROP TABLE _tile_stats;
 DROP TABLE _enriched;
 
