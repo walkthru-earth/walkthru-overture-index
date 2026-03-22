@@ -6,11 +6,12 @@
 --         HTTP range requests + DuckDB-WASM
 --
 -- Architecture:
---   Overture 470M addresses → enriched + H3-indexed Parquet
---   tiles partitioned by country, sorted by (lat, lon) so
---   row-group min/max stats enable spatial pushdown via
---   standard Parquet range requests. No spatial extension
---   needed at query time (lat/lon doubles + Haversine math).
+--   Overture 470M addresses → enriched + H3-indexed GeoParquet
+--   tiles partitioned by country, Hilbert-sorted so geometry
+--   shredding produces native bbox stats per row group.
+--   DuckDB 1.5 auto-shreds Point → STRUCT(x DOUBLE, y DOUBLE)
+--   with ALP compression (~3x vs WKB), and the && operator
+--   pushes spatial predicates down to row-group level.
 --
 -- Output layout:
 --   {output_dir}/geocoder/country=XX/data_0.parquet
@@ -20,16 +21,25 @@
 -- Cloud-native query flow (WASM or CLI):
 --   1. h3_latlng_to_cell(query_lat, query_lon, 5) → h3_index
 --   2. h3_grid_disk(h3_index, 1) → center + 6 neighbors
---   3. Read country file, Parquet pushdown on lat/lon row-group
---      stats prunes to 1-3 row groups (~50K rows each)
---   4. Haversine on lat/lon doubles → nearest addresses
+--   3. Read country file with spatial pushdown:
+--      WHERE geom && ST_MakeEnvelope(lon-0.05, lat-0.05,
+--                                     lon+0.05, lat+0.05)
+--      DuckDB prunes to 1-3 row groups via native bbox stats
+--   4. ST_Distance_Sphere(geom, query_point) → nearest
+--
+-- DuckDB 1.5 features leveraged:
+--   - GEOMETRY is a core type (no extension needed for storage)
+--   - Geometry shredding: Point → STRUCT(x,y) → ALP compressed
+--   - Native Parquet GeospatialStatistics (bbox per row group)
+--   - && operator for spatial filter pushdown
+--   - ST_Hilbert() for spatial sort order
+--   - GEOPARQUET_VERSION 'BOTH' for max reader compatibility
 --
 -- Enrichments from raw Overture:
---   - lat/lon extracted from geometry (drops spatial dependency)
 --   - city/region normalized from address_levels (country-aware)
 --   - full_address constructed for text search / JACCARD
 --   - h3_index at res 5 for tile-based neighbor queries
---   - geometry/bbox/sources/address_levels dropped (~40% smaller)
+--   - bbox/sources/address_levels dropped (~30% smaller)
 -- ============================================================
 
 -- ----------------------------------------------------------
@@ -37,6 +47,8 @@
 -- ----------------------------------------------------------
 -- Reads source once from S3 (470M rows, ~22 GB) and
 -- materializes locally for multi-pass export.
+-- Keeps native GEOMETRY column — DuckDB 1.5 shreds Points
+-- to STRUCT(x DOUBLE, y DOUBLE) with native bbox stats.
 
 .print '>>> Step 1: Enriching 470M Overture addresses...'
 
@@ -44,8 +56,7 @@ CREATE OR REPLACE TABLE _enriched AS
 WITH raw AS (
     SELECT
         id,
-        ST_Y(geometry) AS lat,
-        ST_X(geometry) AS lon,
+        geometry,
         country,
         postcode,
         street,
@@ -64,7 +75,7 @@ WITH raw AS (
 ),
 with_city_region AS (
     SELECT
-        id, lat, lon, country, postcode, street, number, unit, h3_index,
+        id, geometry, country, postcode, street, number, unit, h3_index,
         -- City: finest administrative level (country-aware)
         -- 3-level: [1]=region [2]=province [3]=municipality → city = [3]
         -- 2-level: [1]=region [2]=city → city = [2]
@@ -96,7 +107,7 @@ with_city_region AS (
     FROM raw
 )
 SELECT
-    id, lat, lon, country, postcode, street, number, unit,
+    id, geometry, country, postcode, street, number, unit,
     city, region,
     -- Composite address for text search (JACCARD / FTS)
     CONCAT_WS(', ',
@@ -120,31 +131,35 @@ FROM _enriched;
 -- ----------------------------------------------------------
 -- Step 2: Export geocoder tiles
 -- ----------------------------------------------------------
--- Country-partitioned, sorted by (lat, lon) within each
--- partition for maximum row-group spatial pushdown.
+-- Country-partitioned, Hilbert-sorted for optimal spatial
+-- locality in row groups. DuckDB 1.5 geometry shredding
+-- auto-decomposes Point → STRUCT(x, y) with ALP compression
+-- and writes native bbox stats per row group.
 --
 -- ROW_GROUP_SIZE 50000 → ~1-3 MB per row group → single
 -- HTTP range request per group on CDN/S3.
 -- PARQUET_VERSION v2 → page-level column indexes.
--- ZSTD level 6 → write-once/read-many, 10-20% smaller than
--- level 3 with no decompression penalty (2-3x slower write
--- is fine for a batch pipeline running once per release).
+-- ZSTD level 6 → write-once/read-many optimization.
+-- GEOPARQUET_VERSION 'BOTH' → GeoParquet v1 metadata AND
+-- native Parquet 2.11 GeospatialStatistics (bbox per row
+-- group in ColumnMetaData, readable by ANY Parquet reader).
 
-.print '>>> Step 2: Exporting geocoder tiles (39 country partitions)...'
+.print '>>> Step 2: Exporting geocoder tiles (39 country partitions, Hilbert-sorted)...'
 
 COPY (
     SELECT
-        id, lat, lon, country, postcode, street, number, unit,
+        id, geometry, country, postcode, street, number, unit,
         city, region, full_address, h3_index
     FROM _enriched
-    ORDER BY lat, lon
+    ORDER BY ST_Hilbert(geometry)
 ) TO (getvariable('output_dir') || '/geocoder/')
 (FORMAT PARQUET,
  PARTITION_BY (country),
  PARQUET_VERSION v2,
  COMPRESSION ZSTD,
  COMPRESSION_LEVEL 6,
- ROW_GROUP_SIZE 50000);
+ ROW_GROUP_SIZE 50000,
+ GEOPARQUET_VERSION 'BOTH');
 
 -- ----------------------------------------------------------
 -- Step 3: Build tile statistics (lightweight aggregation)
@@ -159,10 +174,10 @@ SELECT
     country,
     h3_index,
     count(*)::INTEGER AS address_count,
-    min(lon) AS bbox_min_lon,
-    max(lon) AS bbox_max_lon,
-    min(lat) AS bbox_min_lat,
-    max(lat) AS bbox_max_lat,
+    min(ST_X(geometry)) AS bbox_min_lon,
+    max(ST_X(geometry)) AS bbox_max_lon,
+    min(ST_Y(geometry)) AS bbox_min_lat,
+    max(ST_Y(geometry)) AS bbox_max_lat,
     count(DISTINCT postcode) FILTER (postcode IS NOT NULL)::INTEGER AS unique_postcodes
 FROM _enriched
 GROUP BY country, h3_index;
