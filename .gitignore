@@ -4,3 +4,4 @@ __pycache__/
 output/
 duckdb_temp.tmp/
 .env
+docs/
