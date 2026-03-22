@@ -169,13 +169,12 @@ FROM _enriched;
 -- Hilbert-sorted within each partition for tight bbox per
 -- row group. Native geometry shredding + bbox stats.
 
-.print '>>> Step 2: Exporting geocoder tiles (country + H3 res 4 partitions)...'
+.print '>>> Step 2: Exporting geocoder tiles to local scratch (country + H3 res 4)...'
 
--- DuckDB default partitioned_write_max_open_files is 100.
--- With ~4,000-6,000 h3_parent partitions across 39 countries,
--- DuckDB flushes and reopens files as needed. Keeping the
--- default avoids memory pressure since Step 1 already uses
--- ~128 GB of the 144 GB limit.
+-- Write to local scratch dir first. Python post-processing
+-- flattens h3_parent=XXX/data_0.parquet → h3_parent=XXX.parquet
+-- then uploads to S3. This avoids the Hive directory nesting
+-- that PARTITION_BY creates.
 
 COPY (
     SELECT
@@ -183,7 +182,7 @@ COPY (
         city, region, full_address, h3_index, h3_parent
     FROM _enriched
     ORDER BY ST_Hilbert(geometry)
-) TO (getvariable('output_dir') || '/geocoder/')
+) TO (getvariable('scratch_dir') || '/geocoder/')
 (FORMAT PARQUET,
  PARTITION_BY (country, h3_parent),
  PARQUET_VERSION v2,

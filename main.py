@@ -22,12 +22,16 @@ import logging
 import os
 import platform
 import resource
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.request import urlopen
 
 import duckdb
+
+from geocoder import export_and_upload
 
 logging.basicConfig(
     level=logging.INFO,
@@ -367,13 +371,26 @@ def main() -> None:
         log.info("=" * 60)
 
         # Set variables accessible in SQL via getvariable()
-        out_dir = f"{output_base}/{theme}-index/v1/release={release}/h3"
+        # Addresses uses a flat geocoder layout (no /h3 prefix).
+        # Other themes keep the /h3 prefix for backward compatibility.
+        if theme == "addresses":
+            out_dir = f"{output_base}/{theme}-index/v1/release={release}"
+        else:
+            out_dir = f"{output_base}/{theme}-index/v1/release={release}/h3"
         con.sql(f"SET VARIABLE overture_release = '{release}'")
         con.sql(f"SET VARIABLE output_dir = '{out_dir}'")
         con.sql(
             f"SET VARIABLE overture_source = "
             f"'s3://overturemaps-us-west-2/release/{release}'"
         )
+
+        # Addresses theme writes tiles to local scratch dir, then
+        # flattens h3_parent dirs and uploads to S3.
+        scratch_dir = None
+        if theme == "addresses":
+            scratch_dir = tempfile.mkdtemp(prefix="geocoder_")
+            con.sql(f"SET VARIABLE scratch_dir = '{scratch_dir}'")
+            log.info("[%s] Scratch dir: %s", theme.upper(), scratch_dir)
 
         log.info(
             "[%s] Source: s3://overturemaps-us-west-2/release/%s/",
@@ -385,6 +402,16 @@ def main() -> None:
         theme_t0 = time.time()
         try:
             run_sql(con, sql_file, theme)
+
+            # Post-process: flatten partition dirs and upload tiles
+            if scratch_dir:
+                # Parse S3 bucket/prefix from out_dir for boto3
+                # out_dir = "s3://bucket/prefix/addresses-index/..."
+                s3_path = out_dir.removeprefix("s3://")
+                bucket = s3_path.split("/")[0]
+                prefix = "/".join(s3_path.split("/")[1:])
+                export_and_upload(scratch_dir, bucket, prefix)
+
             elapsed = time.time() - theme_t0
             log.info(
                 "[DONE] %s complete in %.1f min (mem=%s)",
@@ -402,6 +429,8 @@ def main() -> None:
                 e,
             )
             failed.append(theme)
+            if scratch_dir:
+                shutil.rmtree(scratch_dir, ignore_errors=True)
 
     # Save state
     Path("state").mkdir(exist_ok=True)
