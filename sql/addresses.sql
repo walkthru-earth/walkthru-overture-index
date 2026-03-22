@@ -190,7 +190,8 @@ COPY (
  COMPRESSION ZSTD,
  COMPRESSION_LEVEL 6,
  ROW_GROUP_SIZE 50000,
- GEOPARQUET_VERSION 'BOTH');
+ GEOPARQUET_VERSION 'BOTH',
+ OVERWRITE);
 
 -- ----------------------------------------------------------
 -- Step 3: Build tile statistics
