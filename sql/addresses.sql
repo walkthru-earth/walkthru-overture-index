@@ -173,10 +173,9 @@ FROM _enriched;
 
 -- DuckDB default partitioned_write_max_open_files is 100.
 -- With ~4,000-6,000 h3_parent partitions across 39 countries,
--- DuckDB needs to flush and reopen files frequently. Raising
--- this reduces write overhead at the cost of more memory.
--- On the 190 GB build machine, 1000 is safe.
-SET partitioned_write_max_open_files = 1000;
+-- DuckDB flushes and reopens files as needed. Keeping the
+-- default avoids memory pressure since Step 1 already uses
+-- ~128 GB of the 144 GB limit.
 
 COPY (
     SELECT
