@@ -36,9 +36,8 @@ def flatten_partitions(scratch_dir: str) -> int:
     We flatten to:
       geocoder/country=US/h3/842a1....parquet
 
-    FILE_SIZE_BYTES in the COPY prevents multi-file splits for most
-    tiles. As a safety net, any partition with multiple files is
-    concatenated via pyarrow.
+    DuckDB may split large partitions into multiple files. Any
+    multi-file partition is concatenated into one via pyarrow.
 
     Returns the number of directories flattened.
     """

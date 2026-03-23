@@ -171,14 +171,17 @@ FROM _enriched;
 -- ----------------------------------------------------------
 -- Two-level partitioning: country + h3_parent (H3 res 4)
 -- Each file is ~0.5-15 MB, small enough for WASM FTS.
--- No global sort needed: each tile is already a small H3 res 4
--- cell (~1,770 km²) so spatial locality is inherent.
--- GeoParquet bbox stats are written per row group regardless.
+-- Sorted by partition keys so DuckDB writes each partition
+-- contiguously → exactly one file per (country, h3_parent).
+-- Without this sort, DuckDB's 100-file open limit causes it
+-- to close and reopen partitions, splitting into data_0, data_1, etc.
+-- This is a cheap sort (two short strings) — DuckDB spills to
+-- temp_directory if needed (unlike ST_Hilbert which OOMed).
 
 .print '>>> Step 2: Exporting geocoder tiles to local scratch (country + H3 res 4)...'
 
 -- Write to local scratch dir first. Python post-processing
--- flattens h3_parent=XXX/data_0.parquet → country=XX/h3/XXX.parquet
+-- renames h3_parent=XXX/data_0.parquet → country=XX/h3/XXX.parquet
 -- then uploads to S3.
 
 COPY (
@@ -186,6 +189,7 @@ COPY (
         id, geometry, country, postcode, street, number, unit,
         city, region, full_address, h3_index, h3_parent
     FROM _enriched
+    ORDER BY country, h3_parent
 ) TO (getvariable('scratch_dir') || '/geocoder/')
 (FORMAT PARQUET,
  PARTITION_BY (country, h3_parent),
@@ -194,7 +198,6 @@ COPY (
  COMPRESSION_LEVEL 6,
  ROW_GROUP_SIZE 50000,
  GEOPARQUET_VERSION 'BOTH',
- FILE_SIZE_BYTES '500MB',
  OVERWRITE);
 
 -- ----------------------------------------------------------
