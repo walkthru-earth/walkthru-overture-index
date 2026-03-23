@@ -32,6 +32,7 @@
 --   postcode_index.parquet (postcode → tile mapping)
 --   region_index.parquet   (region → tile mapping)
 --   city_index.parquet     (city → tile mapping)
+--   street_index.parquet   (street → tile mapping, for fast narrowing)
 --
 -- Cloud-native query flows:
 --
@@ -43,13 +44,13 @@
 --     5. ORDER BY ST_Distance_Sphere(geometry, query_point)
 --
 --   Forward geocode (text → point):
---     1. Parse query → detect type (postcode, region, city, address)
---     2a. Postcode: postcode_index → 1-3 tiles (~fastest)
---     2b. Region:   region_index → 5-50 tiles (+ bbox filter)
---     2c. City:     city_index → 1-5 tiles
---     2d. Address:  tile_index → filter by bbox/region
---     3. Fetch those tile files (~1-15 MB each)
---     4. FTS/BM25 on full_address or JACCARD fallback
+--     1. Parse query → detect type (postcode, region, city, street)
+--     2a. Street:   street_index → 1-2 tiles (~fastest for addresses)
+--     2b. Postcode: postcode_index → 1-3 tiles
+--     2c. City:     city_index → 1-5 tiles (broad fallback)
+--     2d. Region:   region_index → 5-50 tiles (+ bbox filter)
+--     3. Fetch only matching tile(s) via HTTP range requests
+--     4. ILIKE on full_address within the tile(s)
 --
 -- Enrichments from raw Overture:
 --   - CRS set to EPSG:4326 on geometry
@@ -224,12 +225,31 @@ SELECT
 FROM _enriched
 GROUP BY country, h3_parent, postcode, city, region;
 
+SELECT count(*) AS agg_rows FROM _agg;
+
+-- Build street aggregation before dropping _enriched.
+-- Maps each normalized street name to its tile(s).
+-- The WASM client uses this to skip tiles that don't
+-- contain the searched street (~2-5 MB file, fetched once).
+
+.print '>>> Step 3b: Building street aggregation...'
+
+CREATE OR REPLACE TABLE _street_agg AS
+SELECT
+    country,
+    h3_parent,
+    lower(street) AS street_lower,
+    count(*)::INTEGER AS cnt
+FROM _enriched
+WHERE street IS NOT NULL
+GROUP BY country, h3_parent, lower(street);
+
+SELECT count(*) AS street_agg_rows FROM _street_agg;
+
 -- Free the big table immediately (~133 GB)
 DROP TABLE _enriched;
 
-.print '>>> _enriched dropped, building indexes from _agg...'
-
-SELECT count(*) AS agg_rows FROM _agg;
+.print '>>> _enriched dropped, building indexes from _agg + _street_agg...'
 
 -- ----------------------------------------------------------
 -- Step 4: Build tile statistics (from _agg)
@@ -377,10 +397,35 @@ COPY (
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
 -- ----------------------------------------------------------
--- Step 10: Cleanup
+-- Step 10: Export street index (from _street_agg)
+-- ----------------------------------------------------------
+-- Maps each street name to the tile(s) containing it.
+-- The WASM client fetches this once per country (~1-5 MB),
+-- then can narrow "keizersgracht" → exactly 1-2 tiles
+-- instead of scanning all 3+ tiles for a city.
+-- Sorted by (country, street_lower) for prefix pushdown.
+
+.print '>>> Step 10: Building street index...'
+
+COPY (
+    SELECT
+        country,
+        street_lower,
+        list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
+        sum(cnt)::INTEGER AS addr_count
+    FROM _street_agg
+    GROUP BY country, street_lower
+    ORDER BY country, street_lower
+) TO (getvariable('output_dir') || '/street_index.parquet')
+(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
+
+DROP TABLE _street_agg;
+
+-- ----------------------------------------------------------
+-- Step 11: Cleanup
 -- ----------------------------------------------------------
 
-.print '>>> Step 10: Cleanup...'
+.print '>>> Step 11: Cleanup...'
 DROP TABLE _agg;
 
 .print '>>> GEOCODER BUILD COMPLETE'
