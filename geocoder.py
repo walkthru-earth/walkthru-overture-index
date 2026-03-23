@@ -19,10 +19,13 @@ import shutil
 import time
 from pathlib import Path
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 from boto3.s3.transfer import TransferConfig
+from botocore.config import Config
 
 log = logging.getLogger(__name__)
 
@@ -82,11 +85,27 @@ def flatten_partitions(scratch_dir: str) -> int:
     return count
 
 
-def upload_tiles(scratch_dir: str, s3_bucket: str, s3_prefix: str) -> int:
-    """Upload flattened geocoder tiles to S3 using boto3 parallel transfers.
+UPLOAD_WORKERS = 64
+UPLOAD_POOL_CONNECTIONS = UPLOAD_WORKERS + 10
 
-    Uses S3 transfer manager for concurrent multipart uploads.
-    ~4,000-6,000 files at ~1 MB each = ~5-20 GB total.
+
+def _upload_one(
+    s3_client: object,
+    local_path: Path,
+    bucket: str,
+    key: str,
+    transfer_config: TransferConfig,
+) -> str:
+    """Upload a single file. Called from worker threads."""
+    s3_client.upload_file(str(local_path), bucket, key, Config=transfer_config)
+    return key
+
+
+def upload_tiles(scratch_dir: str, s3_bucket: str, s3_prefix: str) -> int:
+    """Upload flattened geocoder tiles to S3 using parallel boto3 transfers.
+
+    Uses ThreadPoolExecutor for file-level parallelism (64 files at once)
+    and TransferConfig for per-file multipart chunk parallelism.
 
     Returns the number of files uploaded.
     """
@@ -101,40 +120,56 @@ def upload_tiles(scratch_dir: str, s3_bucket: str, s3_prefix: str) -> int:
         return 0
 
     log.info(
-        "[UPLOAD] %d tile files → s3://%s/%s/geocoder/",
+        "[UPLOAD] %d tile files → s3://%s/%s/geocoder/ (%d workers)",
         total,
         s3_bucket,
         s3_prefix,
+        UPLOAD_WORKERS,
     )
 
-    s3 = boto3.client("s3")
-    # Aggressive concurrency: 50 threads, 8 MB chunks
-    config = TransferConfig(
-        max_concurrency=50,
-        multipart_chunksize=8 * 1024 * 1024,
+    s3 = boto3.client(
+        "s3",
+        config=Config(
+            max_pool_connections=UPLOAD_POOL_CONNECTIONS,
+            retries={"max_attempts": 5, "mode": "adaptive"},
+        ),
+    )
+    transfer_cfg = TransferConfig(
+        multipart_threshold=16 * 1024 * 1024,
+        multipart_chunksize=16 * 1024 * 1024,
+        max_concurrency=4,
         use_threads=True,
     )
 
     t0 = time.time()
-    count = 0
-    for f in files:
-        rel = f.relative_to(Path(scratch_dir))
-        key = f"{s3_prefix}/{rel}"
-        s3.upload_file(
-            str(f),
-            s3_bucket,
-            key,
-            Config=config,
-            ExtraArgs={"ContentType": "application/octet-stream"},
-        )
-        count += 1
-        if count % 500 == 0:
-            elapsed = time.time() - t0
-            log.info("[UPLOAD] %d/%d files (%.1fs)", count, total, elapsed)
+    done = 0
+    failed = []
+
+    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
+        futures = {}
+        for f in files:
+            rel = f.relative_to(Path(scratch_dir))
+            key = f"{s3_prefix}/{rel}"
+            fut = pool.submit(_upload_one, s3, f, s3_bucket, key, transfer_cfg)
+            futures[fut] = key
+
+        for fut in as_completed(futures):
+            key = futures[fut]
+            try:
+                fut.result()
+                done += 1
+                if done % 1000 == 0:
+                    elapsed = time.time() - t0
+                    log.info("[UPLOAD] %d/%d files (%.1fs)", done, total, elapsed)
+            except Exception as e:
+                log.error("[UPLOAD] FAILED %s: %s", key, e)
+                failed.append(key)
 
     elapsed = time.time() - t0
-    log.info("[UPLOAD] %d files uploaded in %.1fs", count, elapsed)
-    return count
+    log.info("[UPLOAD] %d files uploaded in %.1fs", done, elapsed)
+    if failed:
+        log.error("[UPLOAD] %d files failed", len(failed))
+    return done
 
 
 def export_and_upload(
