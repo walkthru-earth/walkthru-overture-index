@@ -55,7 +55,8 @@
 --
 -- Enrichments from raw Overture:
 --   - CRS set to EPSG:4326 on geometry
---   - city/region normalized from address_levels (country-aware)
+--   - city/region extracted via COALESCE cascade (finest→coarsest level)
+--     Fixes OvertureMaps/data#509: LV/SK/EE have variable-depth levels
 --   - full_address constructed for text search
 --   - h3_index (res 5) + h3_parent (res 4) for spatial tiling
 --   - bbox/sources/address_levels dropped (~30% smaller)
@@ -107,31 +108,25 @@ with_city_region AS (
         h3_h3_to_string(h3_index) AS h3_index,
         -- H3 res 4 parent for file-level partitioning (~1,770 km² per cell)
         h3_h3_to_string(h3_cell_to_parent(h3_index, 4)) AS h3_parent,
-        -- City: finest administrative level (country-aware)
-        -- 3-level: [1]=region [2]=province [3]=municipality → city = [3]
-        -- 2-level: [1]=region [2]=city → city = [2]
-        -- 1-level: [1]=city → city = [1]
-        -- AT exception: [1]=municipality [2]=sub-locality → city = [1]
+        -- City: finest populated administrative level
+        -- Overture address_levels is ordered broadest→finest:
+        --   [1]=region/state  [2]=district/municipality  [3]=city/village
+        -- But depth varies WITHIN a country (see OvertureMaps/data#509):
+        --   LV: Rīga has only level1, towns have level2, villages have level3
+        --   SK: Bratislava districts are level2, municipalities are level3
+        --   EE: towns (linn) are level2, villages (küla) are level3
+        -- Universal COALESCE cascade: try finest first, fall back to coarser
         COALESCE(
-            CASE
-                WHEN country IN ('IT', 'EE', 'LV', 'PL', 'SI', 'SK', 'TW')
-                     AND len(address_levels) >= 3
-                    THEN address_levels[3].value
-                WHEN country = 'AT'
-                    THEN address_levels[1].value
-                WHEN len(address_levels) >= 2
-                    THEN address_levels[2].value
-                WHEN len(address_levels) >= 1
-                    THEN address_levels[1].value
-                ELSE NULL
-            END,
+            CASE WHEN len(address_levels) >= 3 THEN address_levels[3].value END,
+            CASE WHEN len(address_levels) >= 2 THEN address_levels[2].value END,
+            CASE WHEN len(address_levels) >= 1 THEN address_levels[1].value END,
             postal_city
         ) AS city,
         -- Region: top-level admin (state/prefecture/region)
+        -- Only meaningful when there are 2+ levels (otherwise level1 IS the city)
         CASE
-            WHEN len(address_levels) <= 1 THEN NULL
-            WHEN country = 'AT' THEN NULL
-            ELSE address_levels[1].value
+            WHEN len(address_levels) >= 2 THEN address_levels[1].value
+            ELSE NULL
         END AS region
     FROM raw
 )
