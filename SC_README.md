@@ -41,12 +41,18 @@ WHERE building_count > 500
 ORDER BY n_commercial DESC
 LIMIT 20;
 
--- Addresses: urbanization proxy
-SELECT h3_index, address_count, unique_postcodes,
-       h3_cell_to_lat(h3_index) AS lat, h3_cell_to_lng(h3_index) AS lng
-FROM read_parquet('s3://us-west-2.opendata.source.coop/walkthru-earth/indices/addresses-index/v1/release=2026-03-18.0/h3/h3_res=7/data.parquet')
-ORDER BY address_count DESC
-LIMIT 20;
+-- Addresses: reverse geocode (find nearest address to a point)
+-- Step 1: use tile_index to find the right tile
+SELECT country, h3_parent, address_count
+FROM read_parquet('s3://us-west-2.opendata.source.coop/walkthru-earth/indices/addresses-index/v1/release=2026-03-18.0/tile_index.parquet')
+WHERE country = 'NL' AND h3_parent = '841e933ffffffff';
+
+-- Step 2: fetch that single tile (~1 MB) and search
+SELECT full_address, street, number, city, postcode,
+       ST_X(geometry) AS lon, ST_Y(geometry) AS lat
+FROM read_parquet('s3://us-west-2.opendata.source.coop/walkthru-earth/indices/addresses-index/v1/release=2026-03-18.0/geocoder/country=NL/h3/841e933ffffffff.parquet')
+WHERE full_address ILIKE '%keizersgracht%'
+LIMIT 10;
 
 -- Base environment: infrastructure + land use + water
 SELECT h3_index, infra_count, landuse_count, water_count,
@@ -61,27 +67,77 @@ LIMIT 20;
 
 ```
 walkthru-earth/indices/
+
+  ── H3 Aggregate Indices (4 themes) ──────────────────────────
+
   transportation-index/v1/release={version}/h3/
-    h3_res=1/ .. h3_res=10/  data.parquet
+    h3_res=1/data.parquet
+    h3_res=2/data.parquet
+    ...
+    h3_res=10/data.parquet
+
   places-index/v1/release={version}/h3/
-    h3_res=1/ .. h3_res=10/  data.parquet
+    h3_res=1/data.parquet  ...  h3_res=10/data.parquet
+
   buildings-index/v1/release={version}/h3/
-    h3_res=1/ .. h3_res=10/  data.parquet
-  addresses-index/v1/release={version}/h3/
-    h3_res=1/ .. h3_res=10/  data.parquet
+    h3_res=1/data.parquet  ...  h3_res=10/data.parquet
+
   base-index/v1/release={version}/h3/
-    h3_res=1/ .. h3_res=10/  data.parquet
+    h3_res=1/data.parquet  ...  h3_res=10/data.parquet
+
+  ── Address Geocoder (cloud-native tile layout) ──────────────
+
+  addresses-index/v1/release={version}/
+    manifest.parquet                          ← per-country summary (39 rows)
+    tile_index.parquet                        ← per-tile stats + bbox (~17K rows)
+    postcode_index.parquet                    ← postcode → tile list
+    region_index.parquet                      ← region → tile list + bbox
+    city_index.parquet                        ← city → tile list
+    geocoder/
+      country=US/
+        h3/
+          842a101ffffffff.parquet              ← flat GeoParquet tile (~1 MB)
+          842a107ffffffff.parquet
+          ...                                 (~3,931 tiles for US)
+      country=BR/
+        h3/
+          84a8101ffffffff.parquet
+          ...                                 (~4,204 tiles for BR)
+      country=DE/
+        h3/
+          841e111ffffffff.parquet
+          ...                                 (~234 tiles for DE)
+      ...                                     (39 countries, ~17,500 tiles total)
 ```
 
 ## Index Schemas
 
-### Addresses (3 columns)
+### Addresses — Geocoder Tiles (12 columns per tile)
 
 | Column | Description |
 |--------|-------------|
-| `h3_index` | H3 cell ID (BIGINT) |
-| `address_count` | Total addresses |
-| `unique_postcodes` | Distinct postal codes |
+| `id` | Overture address ID |
+| `geometry` | Point geometry (EPSG:4326, GeoParquet) |
+| `country` | ISO 3166-1 alpha-2 country code |
+| `postcode` | Postal code |
+| `street` | Street name |
+| `number` | House number |
+| `unit` | Unit/apartment |
+| `city` | City (country-aware extraction from address_levels) |
+| `region` | State/province/region |
+| `full_address` | Formatted address string (for FTS) |
+| `h3_index` | H3 res 5 hex string (no h3 extension needed) |
+| `h3_parent` | H3 res 4 hex string (= tile file name) |
+
+### Addresses — Lookup Indexes
+
+| File | Schema | Purpose |
+|------|--------|---------|
+| `manifest.parquet` | country, address_count, tile_count, bbox, overture_release | Per-country summary |
+| `tile_index.parquet` | country, h3_parent, address_count, bbox, unique_postcodes, primary_region | Tile discovery for reverse geocoding |
+| `postcode_index.parquet` | country, postcode, tiles[], addr_count | Postcode → tile mapping for forward geocoding |
+| `region_index.parquet` | country, region, tiles[], addr_count, bbox | Region → tile mapping |
+| `city_index.parquet` | country, region, city, tiles[], addr_count | City → tile mapping |
 
 ### Places (31 columns)
 

@@ -11,10 +11,10 @@
 --   Level 2: h3_parent (H3 res 4, ~1,770 km²) → ~0.5-15 MB
 --            per file, small enough for WASM FTS
 --
---   This gives ~4,000-6,000 total files globally:
---   - US: ~2,500 files (~50K addresses each, ~1 MB)
---   - NL: ~20 files (~500K each, ~11 MB)
---   - LI: 1 file (13K addresses, ~300 KB)
+--   This gives ~17,500 total files globally:
+--   - US: ~3,900 files (~30K addresses each, ~1 MB)
+--   - BR: ~4,200 files
+--   - DE: ~234 files
 --
 -- CRS: EPSG:4326 (WGS84) set via ST_SetCRS on geometry
 --
@@ -23,11 +23,10 @@
 --   - Geometry shredding: Point → STRUCT(x,y) → ALP compressed
 --   - Native Parquet 2.11 GeospatialStatistics (bbox/row group)
 --   - && operator for spatial filter pushdown
---   - ST_Hilbert() for spatial sort order
 --   - GEOPARQUET_VERSION 'BOTH' for max reader compatibility
 --
--- Output layout:
---   geocoder/country=XX/h3_parent=YYY/data_0.parquet
+-- Output layout (after Python flatten + upload):
+--   geocoder/country=XX/h3/YYY.parquet   (flat tile files)
 --   manifest.parquet       (per-country stats)
 --   tile_index.parquet     (per-h3_parent tile stats)
 --   postcode_index.parquet (postcode → tile mapping)
@@ -39,7 +38,7 @@
 --   Reverse geocode (point → address):
 --     1. h3_latlng_to_cell(lat, lon, 5) → h3_index
 --     2. h3_cell_to_parent(h3_index, 4) → h3_parent
---     3. Fetch country=XX/h3_parent=YYY/data_0.parquet (~1-15 MB)
+--     3. Fetch country=XX/h3/YYY.parquet (~1-15 MB)
 --     4. WHERE geometry && ST_MakeEnvelope(...)
 --     5. ORDER BY ST_Distance_Sphere(geometry, query_point)
 --
@@ -59,6 +58,12 @@
 --   - h3_index (res 5) + h3_parent (res 4) for spatial tiling
 --   - bbox/sources/address_levels dropped (~30% smaller)
 --   - h3_index stored as hex string (no h3 extension needed)
+--
+-- Memory optimization:
+--   _enriched (469M rows, ~133 GB) is scanned only twice:
+--   once for tile export, once for the combined aggregation.
+--   Then it is dropped immediately, freeing memory for the
+--   index exports which use the much smaller _agg table.
 -- ============================================================
 
 -- ----------------------------------------------------------
@@ -173,9 +178,8 @@ FROM _enriched;
 .print '>>> Step 2: Exporting geocoder tiles to local scratch (country + H3 res 4)...'
 
 -- Write to local scratch dir first. Python post-processing
--- flattens h3_parent=XXX/data_0.parquet → h3_parent=XXX.parquet
--- then uploads to S3. This avoids the Hive directory nesting
--- that PARTITION_BY creates.
+-- flattens h3_parent=XXX/data_0.parquet → country=XX/h3/XXX.parquet
+-- then uploads to S3.
 
 COPY (
     SELECT
@@ -190,38 +194,67 @@ COPY (
  COMPRESSION_LEVEL 6,
  ROW_GROUP_SIZE 50000,
  GEOPARQUET_VERSION 'BOTH',
+ FILE_SIZE_BYTES '500MB',
  OVERWRITE);
 
 -- ----------------------------------------------------------
--- Step 3: Build tile statistics
+-- Step 3: Build combined aggregation (single scan of _enriched)
 -- ----------------------------------------------------------
--- Per-h3_parent stats for tile discovery. The SDK uses this
--- to map a query point → h3_parent → file path.
+-- One scan of 469M rows to compute everything needed for all
+-- lookup indexes. This intermediate is ~1-2M rows (vs 469M),
+-- so all subsequent index exports are fast.
 
-.print '>>> Step 3: Computing tile statistics...'
+.print '>>> Step 3: Building combined aggregation (single scan)...'
+
+CREATE OR REPLACE TABLE _agg AS
+SELECT
+    country,
+    h3_parent,
+    postcode,
+    city,
+    region,
+    count(*)::INTEGER AS cnt,
+    min(ST_X(geometry)) AS min_lon,
+    max(ST_X(geometry)) AS max_lon,
+    min(ST_Y(geometry)) AS min_lat,
+    max(ST_Y(geometry)) AS max_lat
+FROM _enriched
+GROUP BY country, h3_parent, postcode, city, region;
+
+-- Free the big table immediately (~133 GB)
+DROP TABLE _enriched;
+
+.print '>>> _enriched dropped, building indexes from _agg...'
+
+SELECT count(*) AS agg_rows FROM _agg;
+
+-- ----------------------------------------------------------
+-- Step 4: Build tile statistics (from _agg)
+-- ----------------------------------------------------------
+
+.print '>>> Step 4: Computing tile statistics...'
 
 CREATE OR REPLACE TABLE _tile_stats AS
 WITH tile_agg AS (
     SELECT
         country,
         h3_parent,
-        count(*)::INTEGER AS address_count,
-        min(ST_X(geometry)) AS bbox_min_lon,
-        max(ST_X(geometry)) AS bbox_max_lon,
-        min(ST_Y(geometry)) AS bbox_min_lat,
-        max(ST_Y(geometry)) AS bbox_max_lat,
+        sum(cnt)::INTEGER AS address_count,
+        min(min_lon) AS bbox_min_lon,
+        max(max_lon) AS bbox_max_lon,
+        min(min_lat) AS bbox_min_lat,
+        max(max_lat) AS bbox_max_lat,
         count(DISTINCT postcode) FILTER (postcode IS NOT NULL)::INTEGER AS unique_postcodes,
         count(DISTINCT city) FILTER (city IS NOT NULL)::INTEGER AS unique_cities
-    FROM _enriched
+    FROM _agg
     GROUP BY country, h3_parent
 ),
--- Dominant region per tile (most addresses wins)
 tile_regions AS (
     SELECT
         country, h3_parent, region,
-        count(*) AS region_count,
-        ROW_NUMBER() OVER (PARTITION BY country, h3_parent ORDER BY count(*) DESC) AS rn
-    FROM _enriched
+        sum(cnt) AS region_count,
+        ROW_NUMBER() OVER (PARTITION BY country, h3_parent ORDER BY sum(cnt) DESC) AS rn
+    FROM _agg
     WHERE region IS NOT NULL
     GROUP BY country, h3_parent, region
 )
@@ -241,10 +274,10 @@ SELECT
 FROM _tile_stats;
 
 -- ----------------------------------------------------------
--- Step 4: Export manifest (per-country summary)
+-- Step 5: Export manifest (per-country summary)
 -- ----------------------------------------------------------
 
-.print '>>> Step 4: Exporting manifest...'
+.print '>>> Step 5: Exporting manifest...'
 
 COPY (
     SELECT
@@ -265,12 +298,10 @@ COPY (
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
 -- ----------------------------------------------------------
--- Step 5: Export tile index (per-h3_parent stats)
+-- Step 6: Export tile index (per-h3_parent stats)
 -- ----------------------------------------------------------
--- SDK fetches this once (~200 KB), caches it, then uses
--- it to resolve any h3_index → h3_parent → file URL.
 
-.print '>>> Step 5: Exporting tile index...'
+.print '>>> Step 6: Exporting tile index...'
 
 COPY (
     SELECT * FROM _tile_stats
@@ -278,23 +309,21 @@ COPY (
 ) TO (getvariable('output_dir') || '/tile_index.parquet')
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
--- ----------------------------------------------------------
--- Step 6: Export postcode index (for forward geocoding)
--- ----------------------------------------------------------
--- Maps each postcode to the h3_parent tile(s) containing it.
--- Most postcodes span only 1-3 tiles. This allows the SDK
--- to jump straight to the right tile(s) for postcode queries
--- without scanning all tiles in a country.
+DROP TABLE _tile_stats;
 
-.print '>>> Step 6: Building postcode index...'
+-- ----------------------------------------------------------
+-- Step 7: Export postcode index (from _agg)
+-- ----------------------------------------------------------
+
+.print '>>> Step 7: Building postcode index...'
 
 COPY (
     SELECT
         country,
         postcode,
         list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
-        count(*)::INTEGER AS addr_count
-    FROM _enriched
+        sum(cnt)::INTEGER AS addr_count
+    FROM _agg
     WHERE postcode IS NOT NULL AND postcode != ''
     GROUP BY country, postcode
     ORDER BY country, postcode
@@ -302,25 +331,22 @@ COPY (
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
 -- ----------------------------------------------------------
--- Step 7: Export region index (for forward geocoding)
+-- Step 8: Export region index (from _agg)
 -- ----------------------------------------------------------
--- Maps each region to the h3_parent tile(s) containing it.
--- Enables "search California" → jump to the right tiles.
--- Most regions span 5-50 tiles. ~500 regions globally.
 
-.print '>>> Step 7: Building region index...'
+.print '>>> Step 8: Building region index...'
 
 COPY (
     SELECT
         country,
         region,
         list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
-        count(*)::INTEGER AS addr_count,
-        min(ST_X(geometry)) AS bbox_min_lon,
-        max(ST_X(geometry)) AS bbox_max_lon,
-        min(ST_Y(geometry)) AS bbox_min_lat,
-        max(ST_Y(geometry)) AS bbox_max_lat
-    FROM _enriched
+        sum(cnt)::INTEGER AS addr_count,
+        min(min_lon) AS bbox_min_lon,
+        max(max_lon) AS bbox_max_lon,
+        min(min_lat) AS bbox_min_lat,
+        max(max_lat) AS bbox_max_lat
+    FROM _agg
     WHERE region IS NOT NULL
     GROUP BY country, region
     ORDER BY country, region
@@ -328,13 +354,10 @@ COPY (
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
 -- ----------------------------------------------------------
--- Step 8: Export city index (for forward geocoding)
+-- Step 9: Export city index (from _agg)
 -- ----------------------------------------------------------
--- Maps each city to the h3_parent tile(s) containing it.
--- Enables "search Amsterdam" → jump to 1-5 tiles.
--- Most cities fit in 1-3 tiles. ~50K cities globally.
 
-.print '>>> Step 8: Building city index...'
+.print '>>> Step 9: Building city index...'
 
 COPY (
     SELECT
@@ -342,8 +365,8 @@ COPY (
         region,
         city,
         list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
-        count(*)::INTEGER AS addr_count
-    FROM _enriched
+        sum(cnt)::INTEGER AS addr_count
+    FROM _agg
     WHERE city IS NOT NULL
     GROUP BY country, region, city
     ORDER BY country, city
@@ -351,11 +374,10 @@ COPY (
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
 -- ----------------------------------------------------------
--- Step 9: Cleanup
+-- Step 10: Cleanup
 -- ----------------------------------------------------------
 
-.print '>>> Step 9: Cleanup...'
-DROP TABLE _tile_stats;
-DROP TABLE _enriched;
+.print '>>> Step 10: Cleanup...'
+DROP TABLE _agg;
 
 .print '>>> GEOCODER BUILD COMPLETE'

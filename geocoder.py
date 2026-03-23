@@ -5,6 +5,7 @@ produce natively:
 
   1. DuckDB COPY with PARTITION_BY → local scratch (Hive dirs)
   2. Flatten: h3_parent=XXX/data_0.parquet → h3_parent=XXX.parquet
+     (multi-file partitions are concatenated via pyarrow)
   3. Parallel upload to S3 via boto3 s3transfer
 
 This is the only theme that needs post-processing — all other themes
@@ -19,44 +20,66 @@ import time
 from pathlib import Path
 
 import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
 from boto3.s3.transfer import TransferConfig
 
 log = logging.getLogger(__name__)
 
 
 def flatten_partitions(scratch_dir: str) -> int:
-    """Flatten Hive h3_parent directories into flat Parquet files.
+    """Flatten Hive h3_parent directories into flat tile files.
 
-    Renames:
-      geocoder/country=US/h3_parent=842a.../data_0.parquet
-    To:
-      geocoder/country=US/h3_parent=842a....parquet
+    DuckDB PARTITION_BY writes:
+      geocoder/country=US/h3_parent=842a1.../data_0.parquet
 
-    Returns the number of files flattened.
+    We flatten to:
+      geocoder/country=US/h3/842a1....parquet
+
+    FILE_SIZE_BYTES in the COPY prevents multi-file splits for most
+    tiles. As a safety net, any partition with multiple files is
+    concatenated via pyarrow.
+
+    Returns the number of directories flattened.
     """
     geocoder_dir = Path(scratch_dir) / "geocoder"
     if not geocoder_dir.exists():
         return 0
 
     count = 0
+    merged = 0
     for country_dir in sorted(geocoder_dir.iterdir()):
         if not country_dir.is_dir():
             continue
         for h3_dir in sorted(country_dir.iterdir()):
             if not h3_dir.is_dir():
                 continue
-            parquet_files = list(h3_dir.glob("*.parquet"))
+            # Extract h3 hex from "h3_parent=842a1...ffffffff"
+            h3_hex = h3_dir.name.removeprefix("h3_parent=")
+            h3_subdir = country_dir / "h3"
+            h3_subdir.mkdir(exist_ok=True)
+            dest = h3_subdir / f"{h3_hex}.parquet"
+            parquet_files = sorted(h3_dir.glob("*.parquet"))
             if len(parquet_files) == 1:
-                dest = h3_dir.with_suffix(".parquet")
                 shutil.move(str(parquet_files[0]), str(dest))
                 h3_dir.rmdir()
                 count += 1
             elif parquet_files:
-                log.warning(
-                    "[FLATTEN] %s has %d files, skipping",
-                    h3_dir,
-                    len(parquet_files),
+                tables = [pq.read_table(str(f)) for f in parquet_files]
+                combined = pa.concat_tables(tables)
+                pq.write_table(
+                    combined,
+                    str(dest),
+                    compression="zstd",
+                    compression_level=6,
+                    row_group_size=50000,
+                    version="2.6",
                 )
+                shutil.rmtree(str(h3_dir))
+                count += 1
+                merged += 1
+    if merged:
+        log.info("[FLATTEN] Concatenated %d multi-file partitions", merged)
     return count
 
 
