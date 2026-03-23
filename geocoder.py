@@ -4,9 +4,10 @@ Handles the flat-file tile export that DuckDB's PARTITION_BY can't
 produce natively:
 
   1. DuckDB COPY with PARTITION_BY → local scratch (Hive dirs)
-  2. Flatten: h3_parent=XXX/data_0.parquet → h3_parent=XXX.parquet
+  2. Flatten: h3_parent=XXX/data_0.parquet → h3/XXX.parquet
      (multi-file partitions are concatenated via pyarrow)
-  3. Parallel upload to S3 via boto3 s3transfer
+  3. Flatten index partitions: country=XX/data_0.parquet → XX.parquet
+  4. Parallel upload ALL scratch files to S3 via boto3
 
 This is the only theme that needs post-processing — all other themes
 write directly to S3 via DuckDB httpfs.
@@ -30,7 +31,7 @@ from botocore.config import Config
 log = logging.getLogger(__name__)
 
 
-def flatten_partitions(scratch_dir: str) -> int:
+def flatten_geocoder_tiles(scratch_dir: str) -> int:
     """Flatten Hive h3_parent directories into flat tile files.
 
     DuckDB PARTITION_BY writes:
@@ -81,7 +82,51 @@ def flatten_partitions(scratch_dir: str) -> int:
                 count += 1
                 merged += 1
     if merged:
-        log.info("[FLATTEN] Concatenated %d multi-file partitions", merged)
+        log.info("[FLATTEN] Concatenated %d multi-file geocoder partitions", merged)
+    return count
+
+
+def flatten_index_partitions(scratch_dir: str, index_name: str) -> int:
+    """Flatten a Hive-partitioned index into flat per-country files.
+
+    DuckDB PARTITION_BY writes:
+      {index_name}/country=NL/data_0.parquet
+
+    We flatten to:
+      {index_name}/NL.parquet
+
+    Returns the number of country files created.
+    """
+    index_dir = Path(scratch_dir) / index_name
+    if not index_dir.exists():
+        return 0
+
+    count = 0
+    for country_dir in sorted(index_dir.iterdir()):
+        if not country_dir.is_dir():
+            continue
+        cc = country_dir.name.removeprefix("country=")
+        parquet_files = sorted(country_dir.glob("*.parquet"))
+        if not parquet_files:
+            continue
+
+        dest = index_dir / f"{cc}.parquet"
+        if len(parquet_files) == 1:
+            shutil.move(str(parquet_files[0]), str(dest))
+        else:
+            tables = [pq.read_table(str(f)) for f in parquet_files]
+            combined = pa.concat_tables(tables)
+            pq.write_table(
+                combined,
+                str(dest),
+                compression="zstd",
+                compression_level=6,
+                version="2.6",
+            )
+        shutil.rmtree(str(country_dir))
+        count += 1
+
+    log.info("[FLATTEN] %s: %d per-country files", index_name, count)
     return count
 
 
@@ -101,26 +146,26 @@ def _upload_one(
     return key
 
 
-def upload_tiles(scratch_dir: str, s3_bucket: str, s3_prefix: str) -> int:
-    """Upload flattened geocoder tiles to S3 using parallel boto3 transfers.
+def upload_all(scratch_dir: str, s3_bucket: str, s3_prefix: str) -> int:
+    """Upload ALL parquet files under scratch_dir to S3.
+
+    Uploads geocoder tiles, per-country index files, and any other
+    parquet files written to the scratch directory.
 
     Uses ThreadPoolExecutor for file-level parallelism (64 files at once)
     and TransferConfig for per-file multipart chunk parallelism.
 
     Returns the number of files uploaded.
     """
-    geocoder_dir = Path(scratch_dir) / "geocoder"
-    if not geocoder_dir.exists():
-        log.warning("[UPLOAD] No geocoder/ directory in %s", scratch_dir)
-        return 0
-
-    files = sorted(geocoder_dir.rglob("*.parquet"))
+    scratch = Path(scratch_dir)
+    files = sorted(scratch.rglob("*.parquet"))
     total = len(files)
     if not total:
+        log.warning("[UPLOAD] No parquet files in %s", scratch_dir)
         return 0
 
     log.info(
-        "[UPLOAD] %d tile files → s3://%s/%s/geocoder/ (%d workers)",
+        "[UPLOAD] %d files → s3://%s/%s/ (%d workers)",
         total,
         s3_bucket,
         s3_prefix,
@@ -148,7 +193,7 @@ def upload_tiles(scratch_dir: str, s3_bucket: str, s3_prefix: str) -> int:
     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
         futures = {}
         for f in files:
-            rel = f.relative_to(Path(scratch_dir))
+            rel = f.relative_to(scratch)
             key = f"{s3_prefix}/{rel}"
             fut = pool.submit(_upload_one, s3, f, s3_bucket, key, transfer_cfg)
             futures[fut] = key
@@ -177,16 +222,31 @@ def export_and_upload(
     s3_bucket: str,
     s3_prefix: str,
 ) -> None:
-    """Flatten local Hive-partitioned tiles and upload to S3.
+    """Flatten local partitions and upload everything to S3.
 
-    Called by main.py after DuckDB COPY writes tiles to scratch_dir.
+    Called by main.py after DuckDB writes to scratch_dir:
+      - geocoder/country=XX/h3_parent=YYY/  → geocoder/country=XX/h3/YYY.parquet
+      - postcode_index/country=XX/           → postcode_index/XX.parquet
+      - street_index/country=XX/             → street_index/XX.parquet
     """
     t0 = time.time()
 
-    n = flatten_partitions(scratch_dir)
-    log.info("[GEOCODER] Flattened %d partition dirs in %.1fs", n, time.time() - t0)
+    # Flatten geocoder tiles (h3_parent dirs → flat files)
+    n_tiles = flatten_geocoder_tiles(scratch_dir)
+    log.info("[GEOCODER] Flattened %d tile dirs in %.1fs", n_tiles, time.time() - t0)
 
-    upload_tiles(scratch_dir, s3_bucket, s3_prefix)
+    # Flatten per-country index partitions
+    n_postcode = flatten_index_partitions(scratch_dir, "postcode_index")
+    n_street = flatten_index_partitions(scratch_dir, "street_index")
+    log.info(
+        "[GEOCODER] Index partitions: %d postcode + %d street countries",
+        n_postcode,
+        n_street,
+    )
 
+    # Upload everything in scratch_dir
+    upload_all(scratch_dir, s3_bucket, s3_prefix)
+
+    # Cleanup scratch directory
     shutil.rmtree(scratch_dir, ignore_errors=True)
     log.info("[GEOCODER] Total export+upload: %.1fs", time.time() - t0)

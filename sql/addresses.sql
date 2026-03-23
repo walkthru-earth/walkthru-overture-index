@@ -27,12 +27,12 @@
 --
 -- Output layout (after Python flatten + upload):
 --   geocoder/country=XX/h3/YYY.parquet   (flat tile files)
---   manifest.parquet       (per-country stats)
---   tile_index.parquet     (per-h3_parent tile stats)
---   postcode_index.parquet (postcode → tile mapping)
---   region_index.parquet   (region → tile mapping)
---   city_index.parquet     (city → tile mapping)
---   street_index.parquet   (street → tile mapping, for fast narrowing)
+--   manifest.parquet       (per-country stats — global, 3 KB)
+--   tile_index.parquet     (per-h3_parent stats — global, 561 KB)
+--   region_index.parquet   (region → tiles — global, 95 KB)
+--   city_index.parquet     (city → tiles — global, 2.5 MB)
+--   postcode_index/XX.parquet  (per-country postcode → tiles)
+--   street_index/XX.parquet    (per-country street → tiles)
 --
 -- Cloud-native query flows:
 --
@@ -44,11 +44,12 @@
 --     5. ORDER BY ST_Distance_Sphere(geometry, query_point)
 --
 --   Forward geocode (text → point):
---     1. Parse query → detect type (postcode, region, city, street)
---     2a. Street:   street_index → 1-2 tiles (~fastest for addresses)
---     2b. Postcode: postcode_index → 1-3 tiles
---     2c. City:     city_index → 1-5 tiles (broad fallback)
---     2d. Region:   region_index → 5-50 tiles (+ bbox filter)
+--     1. WASM caches per-country index at country selection:
+--        street_index/XX.parquet + postcode_index/XX.parquet
+--     2. Parse query → detect type (postcode, street, city)
+--     2a. Street:   street_index/XX → 1-2 tiles (instant, in-memory)
+--     2b. Postcode: postcode_index/XX → 1-3 tiles (instant, in-memory)
+--     2c. City:     city_index (global) → 1-5 tiles (broad fallback)
 --     3. Fetch only matching tile(s) via HTTP range requests
 --     4. ILIKE on full_address within the tile(s)
 --
@@ -335,10 +336,12 @@ COPY (
 DROP TABLE _tile_stats;
 
 -- ----------------------------------------------------------
--- Step 7: Export postcode index (from _agg)
+-- Step 7: Export postcode index — partitioned by country
 -- ----------------------------------------------------------
+-- Per-country files avoid the 73MB global footer overhead in
+-- WASM. The frontend reads postcode_index/NL.parquet directly.
 
-.print '>>> Step 7: Building postcode index...'
+.print '>>> Step 7: Building postcode index (per-country)...'
 
 COPY (
     SELECT
@@ -350,8 +353,9 @@ COPY (
     WHERE postcode IS NOT NULL AND postcode != ''
     GROUP BY country, postcode
     ORDER BY country, postcode
-) TO (getvariable('output_dir') || '/postcode_index.parquet')
-(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
+) TO (getvariable('scratch_dir') || '/postcode_index/')
+(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
+ PARTITION_BY (country), OVERWRITE);
 
 -- ----------------------------------------------------------
 -- Step 8: Export region index (from _agg)
@@ -397,15 +401,14 @@ COPY (
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
 -- ----------------------------------------------------------
--- Step 10: Export street index (from _street_agg)
+-- Step 10: Export street index — partitioned by country
 -- ----------------------------------------------------------
--- Maps each street name to the tile(s) containing it.
--- The WASM client fetches this once per country (~1-5 MB),
--- then can narrow "keizersgracht" → exactly 1-2 tiles
--- instead of scanning all 3+ tiles for a city.
--- Sorted by (country, street_lower) for prefix pushdown.
+-- Per-country files: street_index/NL.parquet (~1 MB) vs
+-- the old global street_index.parquet (73.6 MB).
+-- WASM reads only the country file — no footer overhead,
+-- no row-group pruning needed, single HTTP request.
 
-.print '>>> Step 10: Building street index...'
+.print '>>> Step 10: Building street index (per-country)...'
 
 COPY (
     SELECT
@@ -416,8 +419,9 @@ COPY (
     FROM _street_agg
     GROUP BY country, street_lower
     ORDER BY country, street_lower
-) TO (getvariable('output_dir') || '/street_index.parquet')
-(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
+) TO (getvariable('scratch_dir') || '/street_index/')
+(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
+ PARTITION_BY (country), OVERWRITE);
 
 DROP TABLE _street_agg;
 

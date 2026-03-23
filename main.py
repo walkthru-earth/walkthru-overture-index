@@ -326,6 +326,29 @@ def run_sql(con: duckdb.DuckDBPyConnection, sql_file: str, theme: str) -> None:
             raise
 
 
+def _cleanup_disk() -> None:
+    """Remove DuckDB temp files and log disk space."""
+    temp_dir = Path("duckdb_temp.tmp")
+    if temp_dir.exists():
+        sz = sum(f.stat().st_size for f in temp_dir.rglob("*") if f.is_file())
+        shutil.rmtree(str(temp_dir), ignore_errors=True)
+        log.info("[CLEANUP] Removed duckdb_temp.tmp (%.1f GB)", sz / 1e9)
+
+    # Also clean any leftover geocoder scratch dirs
+    for d in Path(tempfile.gettempdir()).glob("geocoder_*"):
+        if d.is_dir():
+            shutil.rmtree(str(d), ignore_errors=True)
+            log.info("[CLEANUP] Removed stale scratch dir: %s", d)
+
+    try:
+        total, used, free = shutil.disk_usage(".")
+        log.info(
+            "[CLEANUP] Disk: %.1f GB free / %.1f GB total", free / 1e9, total / 1e9
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
     import argparse
 
@@ -431,6 +454,9 @@ def main() -> None:
             failed.append(theme)
             if scratch_dir:
                 shutil.rmtree(scratch_dir, ignore_errors=True)
+
+        # Disk cleanup after each theme — free scratch and temp space
+        _cleanup_disk()
 
     # Save state
     Path("state").mkdir(exist_ok=True)
