@@ -166,8 +166,9 @@ FROM _enriched;
 -- ----------------------------------------------------------
 -- Two-level partitioning: country + h3_parent (H3 res 4)
 -- Each file is ~0.5-15 MB, small enough for WASM FTS.
--- Hilbert-sorted within each partition for tight bbox per
--- row group. Native geometry shredding + bbox stats.
+-- No global sort needed: each tile is already a small H3 res 4
+-- cell (~1,770 km²) so spatial locality is inherent.
+-- GeoParquet bbox stats are written per row group regardless.
 
 .print '>>> Step 2: Exporting geocoder tiles to local scratch (country + H3 res 4)...'
 
@@ -181,7 +182,6 @@ COPY (
         id, geometry, country, postcode, street, number, unit,
         city, region, full_address, h3_index, h3_parent
     FROM _enriched
-    ORDER BY ST_Hilbert(geometry)
 ) TO (getvariable('scratch_dir') || '/geocoder/')
 (FORMAT PARQUET,
  PARTITION_BY (country, h3_parent),
