@@ -60,7 +60,7 @@
 --   - full_address constructed for text search
 --   - h3_index (res 5) + h3_parent (res 4) for spatial tiling
 --   - bbox/sources/address_levels dropped (~30% smaller)
---   - h3_index stored as hex string (no h3 extension needed)
+--   - h3_index stored as BIGINT (46% smaller, sorted for row-group pushdown)
 --
 -- Memory optimization:
 --   _enriched (469M rows, ~133 GB) is scanned only twice:
@@ -103,10 +103,10 @@ WITH raw AS (
 with_city_region AS (
     SELECT
         id, geometry, country, postcode, street, number, unit,
-        -- Convert H3 BIGINT to hex string so WASM consumers
-        -- don't need the h3 extension to read the value
-        h3_h3_to_string(h3_index) AS h3_index,
-        -- H3 res 4 parent for file-level partitioning (~1,770 km² per cell)
+        -- Keep h3_index as native BIGINT for optimal compression and
+        -- row-group min/max pushdown (46% smaller, perfect skip on filter)
+        h3_index,
+        -- H3 res 4 parent as VARCHAR hex for Hive partition filenames
         h3_h3_to_string(h3_cell_to_parent(h3_index, 4)) AS h3_parent,
         -- City: finest populated administrative level
         -- Overture address_levels is ordered broadest→finest:
@@ -168,12 +168,13 @@ FROM _enriched;
 -- ----------------------------------------------------------
 -- Two-level partitioning: country + h3_parent (H3 res 4)
 -- Each file is ~0.5-15 MB, small enough for WASM FTS.
--- Sorted by partition keys so DuckDB writes each partition
--- contiguously → exactly one file per (country, h3_parent).
--- Without this sort, DuckDB's 100-file open limit causes it
--- to close and reopen partitions, splitting into data_0, data_1, etc.
--- This is a cheap sort (two short strings) — DuckDB spills to
--- temp_directory if needed (unlike ST_Hilbert which OOMed).
+-- Sorted by partition keys + h3_index so:
+-- 1. Each partition writes contiguously (no file splitting)
+-- 2. Within each tile, rows are grouped by h3_index (res-5 cell)
+--    → row groups have tight h3_index min/max ranges
+--    → DuckDB-WASM can skip row groups during filter pushdown
+--    Without h3_index sort: h3 values spread across ALL row groups,
+--    pushdown downloads entire file (~48 MB instead of ~1 MB)
 
 .print '>>> Step 2: Exporting geocoder tiles to local scratch (country + H3 res 4)...'
 
@@ -186,7 +187,7 @@ COPY (
         id, geometry, country, postcode, street, number, unit,
         city, region, full_address, h3_index, h3_parent
     FROM _enriched
-    ORDER BY country, h3_parent
+    ORDER BY country, h3_parent, h3_index
 ) TO (getvariable('scratch_dir') || '/geocoder/')
 (FORMAT PARQUET,
  PARTITION_BY (country, h3_parent),
