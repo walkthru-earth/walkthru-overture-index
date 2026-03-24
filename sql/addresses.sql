@@ -228,6 +228,8 @@ SELECT count(*) AS agg_rows FROM _agg;
 -- Maps each normalized street name to its tile(s).
 -- The WASM client uses this to skip tiles that don't
 -- contain the searched street (~2-5 MB file, fetched once).
+-- Includes city + centroid for autocomplete disambiguation
+-- (primary_city + map pin) — same scan of _enriched, zero extra cost.
 
 .print '>>> Step 3b: Building street aggregation...'
 
@@ -236,10 +238,13 @@ SELECT
     country,
     h3_parent,
     lower(street) AS street_lower,
-    count(*)::INTEGER AS cnt
+    city,
+    count(*)::INTEGER AS cnt,
+    avg(ST_X(geometry)) AS centroid_lon,
+    avg(ST_Y(geometry)) AS centroid_lat
 FROM _enriched
 WHERE street IS NOT NULL
-GROUP BY country, h3_parent, lower(street);
+GROUP BY country, h3_parent, lower(street), city;
 
 SELECT count(*) AS street_agg_rows FROM _street_agg;
 
@@ -344,7 +349,10 @@ COPY (
         country,
         postcode,
         list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
-        sum(cnt)::INTEGER AS addr_count
+        sum(cnt)::INTEGER AS addr_count,
+        -- Centroid as INT32 scaled (×1e6 ≈ 0.11m precision) for map pin
+        ROUND((min(min_lon) + max(max_lon)) / 2 * 1e6)::INTEGER AS centroid_lon_e6,
+        ROUND((min(min_lat) + max(max_lat)) / 2 * 1e6)::INTEGER AS centroid_lat_e6
     FROM _agg
     WHERE postcode IS NOT NULL AND postcode != ''
     GROUP BY country, postcode
@@ -377,10 +385,14 @@ COPY (
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
 
 -- ----------------------------------------------------------
--- Step 9: Export city index (from _agg)
+-- Step 9: Export city index — partitioned by country
 -- ----------------------------------------------------------
+-- Per-country files: city_index/NL.parquet (~50 KB) vs
+-- the old global city_index.parquet (2.5 MB, 252K rows).
+-- WASM reads only the country file — 10x faster (13ms vs 126ms).
+-- Includes INT32 bbox for map zoom-to-city in autocomplete.
 
-.print '>>> Step 9: Building city index...'
+.print '>>> Step 9: Building city index (per-country)...'
 
 COPY (
     SELECT
@@ -388,13 +400,19 @@ COPY (
         region,
         city,
         list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
-        sum(cnt)::INTEGER AS addr_count
+        sum(cnt)::INTEGER AS addr_count,
+        -- Bbox as INT32 scaled (×1e6) for map zoom-to-city
+        ROUND(min(min_lon) * 1e6)::INTEGER AS bbox_min_lon_e6,
+        ROUND(max(max_lon) * 1e6)::INTEGER AS bbox_max_lon_e6,
+        ROUND(min(min_lat) * 1e6)::INTEGER AS bbox_min_lat_e6,
+        ROUND(max(max_lat) * 1e6)::INTEGER AS bbox_max_lat_e6
     FROM _agg
     WHERE city IS NOT NULL
     GROUP BY country, region, city
     ORDER BY country, city
-) TO (getvariable('output_dir') || '/city_index.parquet')
-(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD);
+) TO (getvariable('scratch_dir') || '/city_index/')
+(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
+ PARTITION_BY (country), OVERWRITE);
 
 -- ----------------------------------------------------------
 -- Step 10: Export street index — partitioned by country
@@ -411,7 +429,12 @@ COPY (
         country,
         street_lower,
         list(DISTINCT h3_parent ORDER BY h3_parent) AS tiles,
-        sum(cnt)::INTEGER AS addr_count
+        sum(cnt)::INTEGER AS addr_count,
+        -- primary_city: city where this street has the most addresses
+        arg_max(city, cnt) AS primary_city,
+        -- Weighted centroid as INT32 scaled (×1e6) for map pin
+        ROUND(sum(centroid_lon * cnt) / sum(cnt) * 1e6)::INTEGER AS centroid_lon_e6,
+        ROUND(sum(centroid_lat * cnt) / sum(cnt) * 1e6)::INTEGER AS centroid_lat_e6
     FROM _street_agg
     GROUP BY country, street_lower
     ORDER BY country, street_lower
