@@ -70,8 +70,17 @@ def flatten_geocoder_tiles(scratch_dir: str) -> int:
             # DuckDB PARTITION_BY doesn't preserve ORDER BY within partitions.
             tables = [pq.read_table(str(f)) for f in parquet_files]
             combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-            if "h3_index" in combined.column_names:
+            has_h3 = "h3_index" in combined.column_names
+            if has_h3:
                 combined = combined.sort_by("h3_index")
+
+            # Build sorting_columns metadata so readers know the sort order
+            sorting_cols = None
+            if has_h3:
+                sorting_cols = pq.SortingColumn.from_ordering(
+                    combined.schema, [("h3_index", "ascending")]
+                )
+
             pq.write_table(
                 combined,
                 str(dest),
@@ -79,6 +88,10 @@ def flatten_geocoder_tiles(scratch_dir: str) -> int:
                 compression_level=6,
                 row_group_size=50000,
                 version="2.6",
+                write_statistics=True,
+                write_page_index=True,
+                sorting_columns=sorting_cols,
+                data_page_size=1024 * 1024,
             )
             shutil.rmtree(str(h3_dir))
             count += 1
@@ -114,18 +127,17 @@ def flatten_index_partitions(scratch_dir: str, index_name: str) -> int:
             continue
 
         dest = index_dir / f"{cc}.parquet"
-        if len(parquet_files) == 1:
-            shutil.move(str(parquet_files[0]), str(dest))
-        else:
-            tables = [pq.read_table(str(f)) for f in parquet_files]
-            combined = pa.concat_tables(tables)
-            pq.write_table(
-                combined,
-                str(dest),
-                compression="zstd",
-                compression_level=6,
-                version="2.6",
-            )
+        tables = [pq.read_table(str(f)) for f in parquet_files]
+        combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+        pq.write_table(
+            combined,
+            str(dest),
+            compression="zstd",
+            compression_level=6,
+            version="2.6",
+            write_statistics=True,
+            write_page_index=True,
+        )
         shutil.rmtree(str(country_dir))
         count += 1
 
