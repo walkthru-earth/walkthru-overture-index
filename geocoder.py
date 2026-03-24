@@ -63,23 +63,26 @@ def flatten_geocoder_tiles(scratch_dir: str) -> int:
             h3_subdir.mkdir(exist_ok=True)
             dest = h3_subdir / f"{h3_hex}.parquet"
             parquet_files = sorted(h3_dir.glob("*.parquet"))
-            if len(parquet_files) == 1:
-                shutil.move(str(parquet_files[0]), str(dest))
-                h3_dir.rmdir()
-                count += 1
-            elif parquet_files:
-                tables = [pq.read_table(str(f)) for f in parquet_files]
-                combined = pa.concat_tables(tables)
-                pq.write_table(
-                    combined,
-                    str(dest),
-                    compression="zstd",
-                    compression_level=6,
-                    row_group_size=50000,
-                    version="2.6",
-                )
-                shutil.rmtree(str(h3_dir))
-                count += 1
+            if not parquet_files:
+                continue
+            # Read, sort by h3_index, and write — ensures row groups
+            # have contiguous h3_index ranges for filter pushdown.
+            # DuckDB PARTITION_BY doesn't preserve ORDER BY within partitions.
+            tables = [pq.read_table(str(f)) for f in parquet_files]
+            combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+            if "h3_index" in combined.column_names:
+                combined = combined.sort_by("h3_index")
+            pq.write_table(
+                combined,
+                str(dest),
+                compression="zstd",
+                compression_level=6,
+                row_group_size=50000,
+                version="2.6",
+            )
+            shutil.rmtree(str(h3_dir))
+            count += 1
+            if len(parquet_files) > 1:
                 merged += 1
     if merged:
         log.info("[FLATTEN] Concatenated %d multi-file geocoder partitions", merged)
