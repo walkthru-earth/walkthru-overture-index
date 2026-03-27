@@ -391,6 +391,15 @@ COPY (
 -- the old global city_index.parquet (2.5 MB, 252K rows).
 -- WASM reads only the country file — 10x faster (13ms vs 126ms).
 -- Includes INT32 bbox for map zoom-to-city in autocomplete.
+--
+-- Depth-1 countries (FR, ES, NL, etc.) have no region in Overture,
+-- so same-name cities in geographically distant areas (e.g. mainland
+-- France vs overseas territories) would merge into one row with a
+-- planet-spanning bbox. Fix: include LEFT(postcode, 3) in GROUP BY
+-- as a geographic disambiguator. Using 3 chars (not 2) because FR
+-- overseas prefixes 971-988 all share "97" but span the globe
+-- (971=Guadeloupe, 974=Reunion, 975=St-Pierre-et-Miquelon, etc.).
+-- The postcode prefix is NOT stored in the output, only used for grouping.
 
 .print '>>> Step 9: Building city index (per-country)...'
 
@@ -408,7 +417,7 @@ COPY (
         ROUND(max(max_lat) * 1e6)::INTEGER AS bbox_max_lat_e6
     FROM _agg
     WHERE city IS NOT NULL
-    GROUP BY country, region, city
+    GROUP BY country, region, city, LEFT(postcode, 3)
     ORDER BY country, city
 ) TO (getvariable('scratch_dir') || '/city_index/')
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
