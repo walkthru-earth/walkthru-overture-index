@@ -396,9 +396,12 @@ COPY (
 -- so same-name cities in geographically distant areas (e.g. mainland
 -- France vs overseas territories) would merge into one row with a
 -- planet-spanning bbox. Fix: include LEFT(postcode, 3) in GROUP BY
--- as a geographic disambiguator. Using 3 chars (not 2) because FR
--- overseas prefixes 971-988 all share "97" but span the globe
--- (971=Guadeloupe, 974=Reunion, 975=St-Pierre-et-Miquelon, etc.).
+-- as a geographic disambiguator, but ONLY when region IS NULL.
+-- Countries with region data (US, CA, AU, etc.) already disambiguate
+-- via the region column. Applying postcode grouping to them fragments
+-- cities into many duplicate rows (Ottawa ON had 25 rows, Montreal QC
+-- had 95). Using 3 chars (not 2) because FR overseas prefixes 971-988
+-- all share "97" but span the globe (971=Guadeloupe, 974=Reunion, etc.).
 -- The postcode prefix is NOT stored in the output, only used for grouping.
 
 .print '>>> Step 9: Building city index (per-country)...'
@@ -417,7 +420,7 @@ COPY (
         ROUND(max(max_lat) * 1e6)::INTEGER AS bbox_max_lat_e6
     FROM _agg
     WHERE city IS NOT NULL
-    GROUP BY country, region, city, LEFT(postcode, 3)
+    GROUP BY country, region, city, CASE WHEN region IS NULL THEN LEFT(postcode, 3) ELSE NULL END
     ORDER BY country, city
 ) TO (getvariable('scratch_dir') || '/city_index/')
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
