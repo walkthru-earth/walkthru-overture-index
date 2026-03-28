@@ -62,6 +62,12 @@ jobs:
       - name: Install dependencies
         run: uv sync --no-dev
 
+      - name: Install s5cmd (parallel S3 uploader)
+        run: |
+          curl -sL https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_linux_amd64.tar.gz \
+            | tar xz -C /usr/local/bin s5cmd
+          s5cmd version
+
       - name: Pre-install DuckDB extensions
         run: |
           uv run python -c "
