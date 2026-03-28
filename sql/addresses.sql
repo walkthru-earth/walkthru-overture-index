@@ -33,6 +33,7 @@
 --   city_index.parquet     (city → tiles — global, 2.5 MB)
 --   postcode_index/XX.parquet  (per-country postcode → tiles)
 --   street_index/XX.parquet    (per-country street → tiles)
+--   number_index/XX.parquet    (per-country street → house numbers, on-demand)
 --
 -- Cloud-native query flows:
 --
@@ -50,6 +51,8 @@
 --     2a. Street:   street_index/XX → 1-2 tiles (instant, in-memory)
 --     2b. Postcode: postcode_index/XX → 1-3 tiles (instant, in-memory)
 --     2c. City:     city_index (global) → 1-5 tiles (broad fallback)
+--     2d. Street+Number: number_index/XX → house number suggestions
+--         via HTTP range request (~150 KB, row-group pushdown)
 --     3. Fetch only matching tile(s) via HTTP range requests
 --     4. ILIKE on full_address within the tile(s)
 --
@@ -247,6 +250,24 @@ WHERE street IS NOT NULL
 GROUP BY country, h3_parent, lower(street), city;
 
 SELECT count(*) AS street_agg_rows FROM _street_agg;
+
+-- Build number aggregation before dropping _enriched.
+-- Groups all distinct house numbers per street per country into a sorted list.
+-- Used by number_index for address-level autocomplete via HTTP range requests
+-- (never bulk-loaded into WASM, queried on-demand with row-group pushdown).
+
+.print '>>> Step 3c: Building number aggregation...'
+
+CREATE OR REPLACE TABLE _number_agg AS
+SELECT
+    country,
+    lower(street) AS street_lower,
+    list(DISTINCT number ORDER BY number) AS numbers
+FROM _enriched
+WHERE street IS NOT NULL AND number IS NOT NULL AND number != ''
+GROUP BY country, lower(street);
+
+SELECT count(*) AS number_agg_rows FROM _number_agg;
 
 -- Free the big table immediately (~133 GB)
 DROP TABLE _enriched;
@@ -457,10 +478,42 @@ COPY (
 DROP TABLE _street_agg;
 
 -- ----------------------------------------------------------
--- Step 11: Cleanup
+-- Step 11: Export number index — partitioned by country
+-- ----------------------------------------------------------
+-- Per-country files: number_index/NL.parquet (~9 MB on disk).
+-- NOT bulk-loaded into WASM at prefetch (unlike street/postcode indexes).
+-- Queried on-demand via read_parquet() with HTTP range requests when
+-- the user types a street + number (autocomplete "ready" mode).
+--
+-- DuckDB-WASM flow for "keizersgracht 18":
+--   1. Fetch Parquet footer (~50-100 KB, cached after first query)
+--   2. Row-group pushdown on street_lower min/max stats
+--   3. Fetch only matching row group(s) (~150 KB range request)
+--   4. Filter numbers[] array client-side for prefix "18"
+--   5. Show: keizersgracht 180, 181, 185...
+--
+-- Compared to fetching a full tile (0.5-15 MB), this is 3-100x smaller.
+-- ROW_GROUP_SIZE 2000 keeps each group's street_lower range narrow,
+-- so pushdown skips all but 1-2 groups per query.
+
+.print '>>> Step 11: Building number index (per-country)...'
+
+COPY (
+    SELECT country, street_lower, numbers
+    FROM _number_agg
+    ORDER BY country, street_lower
+) TO (getvariable('scratch_dir') || '/number_index/')
+(FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
+ ROW_GROUP_SIZE 2000,
+ PARTITION_BY (country), OVERWRITE);
+
+DROP TABLE _number_agg;
+
+-- ----------------------------------------------------------
+-- Step 12: Cleanup
 -- ----------------------------------------------------------
 
-.print '>>> Step 11: Cleanup...'
+.print '>>> Step 12: Cleanup...'
 DROP TABLE _agg;
 
 .print '>>> GEOCODER BUILD COMPLETE'
