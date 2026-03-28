@@ -192,7 +192,10 @@ FROM _enriched;
 -- DuckDB writes to local disk (fast NVMe), then main.py uploads via s5cmd.
 -- Creates Hive-style paths: geocoder/country=XX/h3_parent=YYY/data_0.parquet
 -- DuckDB auto-writes bloom filters on dict-encoded columns (street, city, postcode).
--- ROW_GROUP_SIZE 50000 + ORDER BY h3_index = tight min/max for spatial pushdown.
+-- ROW_GROUP_SIZE 25000 (~2.5 MB per group at ~100 bytes/row) balances:
+--   - Fine-grained spatial pushdown via h3_index min/max stats
+--   - Bloom filter skipping for forward geocoding (WHERE street = ...)
+--   - Reasonable fetch size for WASM on mobile (~2.5 MB per range request)
 
 COPY (
     SELECT
@@ -206,7 +209,7 @@ COPY (
  PARQUET_VERSION v2,
  COMPRESSION ZSTD,
  COMPRESSION_LEVEL 6,
- ROW_GROUP_SIZE 50000,
+ ROW_GROUP_SIZE 25000,
  GEOPARQUET_VERSION 'BOTH',
  OVERWRITE);
 

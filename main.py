@@ -130,11 +130,6 @@ def get_duckdb() -> duckdb.DuckDBPyConnection:
     con.sql("SET preserve_insertion_order = false")
     con.sql("SET temp_directory = 'duckdb_temp.tmp'")
 
-    # Partitioned write tuning: reduce file handle churn for 17K+ partitions.
-    # Default is 100, which causes constant flush/reopen cycles on large outputs.
-    con.sql("SET partitioned_write_max_open_files = 2000")
-    log.info("[DUCKDB] partitioned_write_max_open_files = 2000")
-
     # Memory management: cap at 80% of system RAM so OS keeps enough
     # for networking, DNS, page cache. DuckDB spills to temp_directory.
     try:
@@ -271,6 +266,60 @@ def s5cmd_upload(local_dir: str, s3_dest: str) -> None:
         elapsed,
         speed,
     )
+
+
+def merge_split_partitions(scratch_dir: str) -> None:
+    """Merge split partition files (data_0, data_1, ...) into single files.
+
+    DuckDB's partitioned writer creates multiple files per partition when
+    partitioned_write_max_open_files is exceeded (default 100). The frontend
+    fetches data_0.parquet by exact path (no glob), so each partition must
+    contain exactly one file.
+
+    Re-writes with matching Parquet settings so bloom filters are regenerated
+    (DuckDB auto-creates bloom filters on dict-encoded columns like street,
+    city, postcode). ROW_GROUP_SIZE 25000 preserves spatial pushdown granularity.
+    """
+    scratch = Path(scratch_dir)
+    split_dirs = [p.parent for p in scratch.rglob("data_1.parquet")]
+
+    if not split_dirs:
+        log.info("[MERGE] No split partitions found")
+        return
+
+    log.info("[MERGE] Found %d split partition(s), merging...", len(split_dirs))
+    t0 = time.time()
+    merge_con = duckdb.connect()
+
+    for d in split_dirs:
+        parts = sorted(d.glob("data_*.parquet"))
+        total_before = sum(p.stat().st_size for p in parts)
+        merged = d / "_merged.parquet"
+
+        glob_path = str(d / "data_*.parquet")
+        merge_con.sql(
+            f"COPY (FROM read_parquet('{glob_path}')) "
+            f"TO '{merged}' (FORMAT PARQUET, PARQUET_VERSION v2, "
+            f"COMPRESSION ZSTD, COMPRESSION_LEVEL 6, "
+            f"ROW_GROUP_SIZE 25000)"
+        )
+
+        for p in parts:
+            p.unlink()
+        merged.rename(d / "data_0.parquet")
+
+        merged_size = (d / "data_0.parquet").stat().st_size
+        log.info(
+            "[MERGE] %s: %d files (%.1f MB) -> 1 (%.1f MB)",
+            d.relative_to(scratch),
+            len(parts),
+            total_before / 1e6,
+            merged_size / 1e6,
+        )
+
+    merge_con.close()
+    elapsed = time.time() - t0
+    log.info("[MERGE] Done in %.1fs (%d partitions merged)", elapsed, len(split_dirs))
 
 
 def run_sql(con: duckdb.DuckDBPyConnection, sql_file: str, theme: str) -> None:
@@ -509,7 +558,12 @@ def main() -> None:
                 _mem_gb(),
             )
 
-            # Phase 2: Upload to S3 in parallel
+            # Phase 2: Merge any split partition files into single files.
+            # DuckDB creates data_0, data_1, ... when open file limit is
+            # exceeded. Frontend needs exactly one file per partition.
+            merge_split_partitions(local_out)
+
+            # Phase 3: Upload to S3 in parallel
             if s3_base:
                 s5cmd_upload(local_out, s3_dest)
 
