@@ -64,7 +64,7 @@ jobs:
 
       - name: Install s5cmd (parallel S3 uploader)
         run: |
-          curl -sL https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_linux_amd64.tar.gz \
+          curl -sL https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz \
             | tar xz -C /usr/local/bin s5cmd
           s5cmd version
 
