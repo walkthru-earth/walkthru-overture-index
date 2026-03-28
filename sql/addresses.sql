@@ -25,7 +25,7 @@
 --   - && operator for spatial filter pushdown
 --   - GEOPARQUET_VERSION 'BOTH' for max reader compatibility
 --
--- Output layout (written directly to S3 by DuckDB, no Python post-processing):
+-- Output layout (DuckDB writes locally, s5cmd uploads to S3 in parallel):
 --   geocoder/country=XX/h3_parent=YYY/data_0.parquet  (Hive tile files)
 --   manifest.parquet       (per-country stats — global, 3 KB)
 --   tile_index.parquet     (per-h3_parent stats — global, 561 KB)
@@ -189,8 +189,8 @@ FROM _enriched;
 
 .print '>>> Step 2: Exporting geocoder tiles directly to S3 (country + H3 res 4)...'
 
--- Write directly to S3 via DuckDB httpfs. No Python post-processing.
--- DuckDB creates Hive-style paths: geocoder/country=XX/h3_parent=YYY/data_0.parquet
+-- DuckDB writes to local disk (fast NVMe), then main.py uploads via s5cmd.
+-- Creates Hive-style paths: geocoder/country=XX/h3_parent=YYY/data_0.parquet
 -- DuckDB auto-writes bloom filters on dict-encoded columns (street, city, postcode).
 -- ROW_GROUP_SIZE 50000 + ORDER BY h3_index = tight min/max for spatial pushdown.
 

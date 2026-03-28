@@ -23,6 +23,7 @@ import os
 import platform
 import resource
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -129,6 +130,11 @@ def get_duckdb() -> duckdb.DuckDBPyConnection:
     con.sql("SET preserve_insertion_order = false")
     con.sql("SET temp_directory = 'duckdb_temp.tmp'")
 
+    # Partitioned write tuning: reduce file handle churn for 17K+ partitions.
+    # Default is 100, which causes constant flush/reopen cycles on large outputs.
+    con.sql("SET partitioned_write_max_open_files = 2000")
+    log.info("[DUCKDB] partitioned_write_max_open_files = 2000")
+
     # Memory management: cap at 80% of system RAM so OS keeps enough
     # for networking, DNS, page cache. DuckDB spills to temp_directory.
     try:
@@ -185,36 +191,86 @@ def get_duckdb() -> duckdb.DuckDBPyConnection:
 
 
 def configure_output(con: duckdb.DuckDBPyConnection) -> str:
-    """Configure S3 output credentials. Returns output base path."""
+    """Configure S3 output path. Returns s3://bucket/prefix base path.
+
+    DuckDB no longer writes to S3 directly. All COPY TO goes to local
+    scratch, then s5cmd uploads in parallel (see s5cmd_upload).
+    """
     if not S3_BUCKET:
-        log.info("[OUTPUT] No S3_BUCKET — writing to ./output/")
-        Path("output").mkdir(parents=True, exist_ok=True)
-        return "output"
-
-    aws_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    aws_secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-
-    if aws_key and aws_secret:
-        con.sql(f"""
-            CREATE OR REPLACE SECRET output_s3 (
-                TYPE S3,
-                KEY_ID '{aws_key}',
-                SECRET '{aws_secret}',
-                REGION '{AWS_REGION}',
-                URL_STYLE 'path',
-                SCOPE 's3://{S3_BUCKET}'
-            )
-        """)
-        log.info("[OUTPUT] S3 secret configured for s3://%s/", S3_BUCKET)
-    else:
-        log.warning("[OUTPUT] S3_BUCKET set but AWS credentials missing!")
+        log.info("[OUTPUT] No S3_BUCKET, will write to ./output/")
+        return ""
 
     parts = [S3_BUCKET]
     if S3_PREFIX:
         parts.append(S3_PREFIX)
     base = "/".join(parts)
-    log.info("[OUTPUT] Base path: s3://%s/", base)
+    log.info("[OUTPUT] S3 destination: s3://%s/", base)
     return f"s3://{base}"
+
+
+def s5cmd_upload(local_dir: str, s3_dest: str) -> None:
+    """Upload local directory to S3 using s5cmd for parallel uploads.
+
+    s5cmd is a Go-based parallel S3 tool, ~12x faster than aws-cli.
+    Install: go install github.com/peak/s5cmd/v2@latest
+    Or: https://github.com/peak/s5cmd/releases
+    """
+    # Count files to upload
+    file_count = sum(1 for _ in Path(local_dir).rglob("*.parquet"))
+    total_size = sum(f.stat().st_size for f in Path(local_dir).rglob("*.parquet"))
+    log.info(
+        "[UPLOAD] %d parquet files (%.1f GB) → %s",
+        file_count,
+        total_size / 1e9,
+        s3_dest,
+    )
+
+    t0 = time.time()
+
+    # Try s5cmd first (fastest), fall back to aws cli
+    s5cmd = shutil.which("s5cmd")
+    if s5cmd:
+        log.info("[UPLOAD] Using s5cmd (parallel)")
+        result = subprocess.run(
+            [
+                s5cmd,
+                "--numworkers",
+                "256",
+                "cp",
+                f"{local_dir}/*",
+                f"{s3_dest}/",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            log.error("[UPLOAD] s5cmd stderr: %s", result.stderr[:500])
+            raise RuntimeError(f"s5cmd upload failed (exit {result.returncode})")
+    else:
+        log.info("[UPLOAD] s5cmd not found, falling back to aws s3 sync")
+        result = subprocess.run(
+            [
+                "aws",
+                "s3",
+                "sync",
+                local_dir,
+                s3_dest,
+                "--only-show-errors",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            log.error("[UPLOAD] aws sync stderr: %s", result.stderr[:500])
+            raise RuntimeError(f"aws s3 sync failed (exit {result.returncode})")
+
+    elapsed = time.time() - t0
+    speed = total_size / 1e6 / max(elapsed, 0.1)
+    log.info(
+        "[UPLOAD] Done in %.1fs (%.0f MB/s)",
+        elapsed,
+        speed,
+    )
 
 
 def run_sql(con: duckdb.DuckDBPyConnection, sql_file: str, theme: str) -> None:
@@ -367,7 +423,27 @@ def main() -> None:
     # Setup
     pipeline_t0 = time.time()
     con = get_duckdb()
-    output_base = configure_output(con)
+    s3_base = configure_output(con)
+
+    # Smoke-test the upload path before DuckDB does any heavy work.
+    # Writes a tiny .txt to S3 so we fail fast on bad credentials,
+    # missing s5cmd/aws-cli, or wrong bucket permissions.
+    if s3_base:
+        log.info("[PREFLIGHT] Testing upload to %s ...", s3_base)
+        preflight_dir = Path("scratch/_preflight")
+        preflight_dir.mkdir(parents=True, exist_ok=True)
+        (preflight_dir / "_upload_test.txt").write_text(
+            f"preflight check — release={release}\n"
+        )
+        try:
+            s5cmd_upload(str(preflight_dir.resolve()), s3_base)
+            log.info("[PREFLIGHT] Upload OK")
+        except Exception as e:
+            log.error("[PREFLIGHT] Upload FAILED: %s", e)
+            log.error("[PREFLIGHT] Fix credentials or install s5cmd before continuing.")
+            shutil.rmtree(str(preflight_dir), ignore_errors=True)
+            sys.exit(1)
+        shutil.rmtree(str(preflight_dir), ignore_errors=True)
 
     # Build each theme
     completed = []
@@ -384,15 +460,29 @@ def main() -> None:
         log.info("[START] Theme %d/%d: %s", i, len(themes), theme)
         log.info("=" * 60)
 
-        # Set variables accessible in SQL via getvariable()
-        # All themes write directly to S3 via DuckDB httpfs.
-        # Addresses uses Hive-style partition paths (no Python post-processing).
+        # Compute S3 destination and local scratch directory.
+        # DuckDB writes to local disk (fast NVMe), then s5cmd uploads
+        # in parallel. This is 5-10x faster than DuckDB writing to S3
+        # directly via httpfs (17K+ files = 51K+ HTTP round-trips).
         if theme == "addresses":
-            out_dir = f"{output_base}/{theme}-index/v2/release={release}"
+            s3_dest = f"{s3_base}/{theme}-index/v2/release={release}"
         else:
-            out_dir = f"{output_base}/{theme}-index/v1/release={release}/h3"
+            s3_dest = f"{s3_base}/{theme}-index/v1/release={release}/h3"
+
+        # Local scratch: use ./scratch/<theme> (NVMe, not tmpfs)
+        scratch_dir = Path("scratch") / theme
+        if scratch_dir.exists():
+            shutil.rmtree(str(scratch_dir))
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        local_out = str(scratch_dir.resolve())
+
+        # If no S3 bucket, write to ./output/ directly
+        if not s3_base:
+            local_out = str(Path("output").resolve())
+            Path(local_out).mkdir(parents=True, exist_ok=True)
+
         con.sql(f"SET VARIABLE overture_release = '{release}'")
-        con.sql(f"SET VARIABLE output_dir = '{out_dir}'")
+        con.sql(f"SET VARIABLE output_dir = '{local_out}'")
         con.sql(
             f"SET VARIABLE overture_source = "
             f"'s3://overturemaps-us-west-2/release/{release}'"
@@ -403,11 +493,25 @@ def main() -> None:
             theme.upper(),
             release,
         )
-        log.info("[%s] Output: %s/", theme.upper(), out_dir)
+        log.info("[%s] Local scratch: %s", theme.upper(), local_out)
+        if s3_base:
+            log.info("[%s] S3 dest: %s", theme.upper(), s3_dest)
 
         theme_t0 = time.time()
         try:
+            # Phase 1: DuckDB writes to local disk
             run_sql(con, sql_file, theme)
+            sql_elapsed = time.time() - theme_t0
+            log.info(
+                "[%s] SQL done in %.1f min (mem=%s)",
+                theme.upper(),
+                sql_elapsed / 60,
+                _mem_gb(),
+            )
+
+            # Phase 2: Upload to S3 in parallel
+            if s3_base:
+                s5cmd_upload(local_out, s3_dest)
 
             elapsed = time.time() - theme_t0
             log.info(
@@ -427,7 +531,11 @@ def main() -> None:
             )
             failed.append(theme)
 
-        # Disk cleanup after each theme — free scratch and temp space
+        # Disk cleanup: remove scratch and DuckDB temp files
+        if scratch_dir.exists():
+            sz = sum(f.stat().st_size for f in scratch_dir.rglob("*") if f.is_file())
+            shutil.rmtree(str(scratch_dir), ignore_errors=True)
+            log.info("[CLEANUP] Removed scratch/%s (%.1f GB)", theme, sz / 1e9)
         _cleanup_disk()
 
     # Save state
