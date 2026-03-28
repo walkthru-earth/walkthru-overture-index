@@ -25,15 +25,15 @@
 --   - && operator for spatial filter pushdown
 --   - GEOPARQUET_VERSION 'BOTH' for max reader compatibility
 --
--- Output layout (after Python flatten + upload):
---   geocoder/country=XX/h3/YYY.parquet   (flat tile files)
+-- Output layout (written directly to S3 by DuckDB, no Python post-processing):
+--   geocoder/country=XX/h3_parent=YYY/data_0.parquet  (Hive tile files)
 --   manifest.parquet       (per-country stats — global, 3 KB)
 --   tile_index.parquet     (per-h3_parent stats — global, 561 KB)
 --   region_index.parquet   (region → tiles — global, 95 KB)
---   city_index.parquet     (city → tiles — global, 2.5 MB)
---   postcode_index/XX.parquet  (per-country postcode → tiles)
---   street_index/XX.parquet    (per-country street → tiles)
---   number_index/XX.parquet    (per-country street → house numbers, on-demand)
+--   city_index/country=XX/data_0.parquet   (per-country cities, Hive)
+--   postcode_index/country=XX/data_0.parquet  (per-country postcodes, Hive)
+--   street_index/country=XX/data_0.parquet    (per-country streets, Hive)
+--   number_index/country=XX/data_0.parquet    (per-country house numbers, Hive)
 --
 -- Cloud-native query flows:
 --
@@ -187,11 +187,12 @@ FROM _enriched;
 --    Without h3_index sort: h3 values spread across ALL row groups,
 --    pushdown downloads entire file (~48 MB instead of ~1 MB)
 
-.print '>>> Step 2: Exporting geocoder tiles to local scratch (country + H3 res 4)...'
+.print '>>> Step 2: Exporting geocoder tiles directly to S3 (country + H3 res 4)...'
 
--- Write to local scratch dir first. Python post-processing
--- renames h3_parent=XXX/data_0.parquet → country=XX/h3/XXX.parquet
--- then uploads to S3.
+-- Write directly to S3 via DuckDB httpfs. No Python post-processing.
+-- DuckDB creates Hive-style paths: geocoder/country=XX/h3_parent=YYY/data_0.parquet
+-- DuckDB auto-writes bloom filters on dict-encoded columns (street, city, postcode).
+-- ROW_GROUP_SIZE 50000 + ORDER BY h3_index = tight min/max for spatial pushdown.
 
 COPY (
     SELECT
@@ -199,7 +200,7 @@ COPY (
         city, region, full_address, h3_index, h3_parent
     FROM _enriched
     ORDER BY country, h3_parent, h3_index
-) TO (getvariable('scratch_dir') || '/geocoder/')
+) TO (getvariable('output_dir') || '/geocoder/')
 (FORMAT PARQUET,
  PARTITION_BY (country, h3_parent),
  PARQUET_VERSION v2,
@@ -386,7 +387,7 @@ COPY (
     WHERE postcode IS NOT NULL AND postcode != ''
     GROUP BY country, postcode
     ORDER BY country, postcode
-) TO (getvariable('scratch_dir') || '/postcode_index/')
+) TO (getvariable('output_dir') || '/postcode_index/')
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
  PARTITION_BY (country), OVERWRITE);
 
@@ -451,7 +452,7 @@ COPY (
     WHERE city IS NOT NULL
     GROUP BY country, region, city, CASE WHEN region IS NULL THEN LEFT(postcode, 3) ELSE NULL END
     ORDER BY country, city
-) TO (getvariable('scratch_dir') || '/city_index/')
+) TO (getvariable('output_dir') || '/city_index/')
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
  PARTITION_BY (country), OVERWRITE);
 
@@ -479,7 +480,7 @@ COPY (
     FROM _street_agg
     GROUP BY country, street_lower
     ORDER BY country, street_lower
-) TO (getvariable('scratch_dir') || '/street_index/')
+) TO (getvariable('output_dir') || '/street_index/')
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
  PARTITION_BY (country), OVERWRITE);
 
@@ -488,21 +489,25 @@ DROP TABLE _street_agg;
 -- ----------------------------------------------------------
 -- Step 11: Export number index — partitioned by country
 -- ----------------------------------------------------------
--- Per-country files: number_index/NL.parquet (~9 MB on disk).
+-- Per-country files: number_index/country=XX/data_0.parquet (~9 MB on disk).
 -- NOT bulk-loaded into WASM at prefetch (unlike street/postcode indexes).
 -- Queried on-demand via read_parquet() with HTTP range requests when
 -- the user types a street + number (autocomplete "ready" mode).
 --
--- DuckDB-WASM flow for "keizersgracht 18":
---   1. Fetch Parquet footer (~50-100 KB, cached after first query)
---   2. Row-group pushdown on street_lower min/max stats
---   3. Fetch only matching row group(s) (~150 KB range request)
---   4. Filter numbers[] array client-side for prefix "18"
---   5. Show: keizersgracht 180, 181, 185...
+-- Written directly to S3 by DuckDB, preserving:
+--   - ROW_GROUP_SIZE 2000 (narrow street_lower ranges per group)
+--   - Bloom filters on dict-encoded columns (automatic in DuckDB 1.2+)
+--   - Sorted by street_lower for tight min/max row-group stats
 --
--- Compared to fetching a full tile (0.5-15 MB), this is 3-100x smaller.
--- ROW_GROUP_SIZE 2000 keeps each group's street_lower range narrow,
--- so pushdown skips all but 1-2 groups per query.
+-- DuckDB-WASM flow for "keizersgracht 18":
+--   1. Fetch Parquet footer (~1 KB, cached after first query)
+--   2. Bloom filter check on street_lower → skip ~67/68 groups
+--   3. Row-group min/max pushdown → confirm 1-2 matching groups
+--   4. Fetch only matching row group(s) (~100-150 KB range request)
+--   5. Filter numbers[] array client-side for prefix "18"
+--   6. Show: keizersgracht 180, 181, 185...
+--
+-- Compared to fetching a full tile (0.5-15 MB), this is 50-100x smaller.
 
 .print '>>> Step 11: Building number index (per-country)...'
 
@@ -510,7 +515,7 @@ COPY (
     SELECT country, street_lower, numbers
     FROM _number_agg
     ORDER BY country, street_lower
-) TO (getvariable('scratch_dir') || '/number_index/')
+) TO (getvariable('output_dir') || '/number_index/')
 (FORMAT PARQUET, PARQUET_VERSION v2, COMPRESSION ZSTD,
  ROW_GROUP_SIZE 2000,
  PARTITION_BY (country), OVERWRITE);
