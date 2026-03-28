@@ -92,10 +92,10 @@ def flatten_geocoder_tiles(scratch_dir: str) -> int:
                 write_page_index=True,
                 sorting_columns=sorting_cols,
                 data_page_size=1024 * 1024,
-                # Bloom filters on street enable row-group skipping for
-                # direct forward-geocode queries (WHERE lower(street) = 'x').
-                # With 9 row groups per tile, bloom filters eliminate ~8/9 groups.
-                write_bloom_filter_for=["street"],
+                # TODO: Add bloom filters on street when PyArrow gains write support
+                # (PR apache/arrow#49377, expected in PyArrow 24+).
+                # Bloom filters would enable row-group skipping for direct
+                # forward-geocode queries (WHERE lower(street) = 'x').
             )
             shutil.rmtree(str(h3_dir))
             count += 1
@@ -161,8 +161,10 @@ def flatten_index_partitions(
         }
         if row_group_size is not None:
             write_kwargs["row_group_size"] = row_group_size
-        if bloom_filter_columns:
-            write_kwargs["write_bloom_filter_for"] = bloom_filter_columns
+        # TODO: Add bloom filters when PyArrow gains write support
+        # (PR apache/arrow#49377, expected in PyArrow 24+).
+        # if bloom_filter_columns:
+        #     write_kwargs["bloom_filter_options"] = {col: True for col in bloom_filter_columns}
         if sort_cols is not None:
             write_kwargs["sorting_columns"] = sort_cols
 
@@ -286,8 +288,9 @@ def export_and_upload(
     n_street = flatten_index_partitions(scratch_dir, "street_index")
     n_city = flatten_index_partitions(scratch_dir, "city_index")
     # number_index is queried on-demand via HTTP range requests (not bulk-loaded).
-    # Small row groups (2000) + bloom filters on street_lower enable DuckDB-WASM
-    # to fetch only ~100-150 KB per query instead of the full file (7-12 MB).
+    # Small row groups (2000) + sorting enable DuckDB-WASM row-group pushdown,
+    # fetching only ~100-150 KB per query instead of the full file (7-12 MB).
+    # bloom_filter_columns is accepted but no-op until PyArrow 24+ (see TODO in flatten).
     n_number = flatten_index_partitions(
         scratch_dir,
         "number_index",
