@@ -275,7 +275,7 @@ def export_and_upload(
       - postcode_index/country=XX/           → postcode_index/XX.parquet
       - street_index/country=XX/             → street_index/XX.parquet
       - city_index/country=XX/               → city_index/XX.parquet
-      - number_index/country=XX/             → number_index/XX.parquet
+      - number_index/country=XX/data_0.parquet  (kept as Hive, not flattened)
     """
     t0 = time.time()
 
@@ -287,23 +287,16 @@ def export_and_upload(
     n_postcode = flatten_index_partitions(scratch_dir, "postcode_index")
     n_street = flatten_index_partitions(scratch_dir, "street_index")
     n_city = flatten_index_partitions(scratch_dir, "city_index")
-    # number_index is queried on-demand via HTTP range requests (not bulk-loaded).
-    # Small row groups (2000) + sorting enable DuckDB-WASM row-group pushdown,
-    # fetching only ~100-150 KB per query instead of the full file (7-12 MB).
-    # bloom_filter_columns is accepted but no-op until PyArrow 24+ (see TODO in flatten).
-    n_number = flatten_index_partitions(
-        scratch_dir,
-        "number_index",
-        row_group_size=2000,
-        bloom_filter_columns=["street_lower"],
-        sorting_columns=[("street_lower", "ascending")],
-    )
+    # number_index: skip flatten, keep DuckDB's Hive output as-is.
+    # DuckDB writes ROW_GROUP_SIZE 2000 + bloom filters (automatic on dict-encoded
+    # columns) + sorted by street_lower. PyArrow rewrite would strip bloom filters
+    # since PyArrow 23 has no bloom filter write support.
+    # Hive path: number_index/country=XX/data_0.parquet
     log.info(
-        "[GEOCODER] Index partitions: %d postcode + %d street + %d city + %d number countries",
+        "[GEOCODER] Index partitions: %d postcode + %d street + %d city countries (number_index kept as Hive)",
         n_postcode,
         n_street,
         n_city,
-        n_number,
     )
 
     # Upload everything in scratch_dir
