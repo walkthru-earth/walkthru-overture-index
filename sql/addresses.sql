@@ -90,7 +90,15 @@ WITH raw AS (
         country,
         postcode,
         street,
-        number,
+        -- JP fix: Overture's number field for Japan is "banchi-coordZone" where
+        -- the trailing suffix (1-19) is the MLIT planar rectangular coordinate
+        -- system zone (座標系番号), leaked from ISJ source via OpenAddresses.
+        -- Example: "362-9" = lot 362 in zone 9 (Kanto). Strip the zone suffix
+        -- so the number contains only the real banchi (block/lot number).
+        CASE WHEN country = 'JP' AND number LIKE '%-%'
+            THEN split_part(number, '-', 1)
+            ELSE number
+        END AS number,
         unit,
         postal_city,
         address_levels,
