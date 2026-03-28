@@ -92,6 +92,10 @@ def flatten_geocoder_tiles(scratch_dir: str) -> int:
                 write_page_index=True,
                 sorting_columns=sorting_cols,
                 data_page_size=1024 * 1024,
+                # Bloom filters on street enable row-group skipping for
+                # direct forward-geocode queries (WHERE lower(street) = 'x').
+                # With 9 row groups per tile, bloom filters eliminate ~8/9 groups.
+                write_bloom_filter_for=["street"],
             )
             shutil.rmtree(str(h3_dir))
             count += 1
@@ -102,7 +106,14 @@ def flatten_geocoder_tiles(scratch_dir: str) -> int:
     return count
 
 
-def flatten_index_partitions(scratch_dir: str, index_name: str) -> int:
+def flatten_index_partitions(
+    scratch_dir: str,
+    index_name: str,
+    *,
+    row_group_size: int | None = None,
+    bloom_filter_columns: list[str] | None = None,
+    sorting_columns: list[tuple[str, str]] | None = None,
+) -> int:
     """Flatten a Hive-partitioned index into flat per-country files.
 
     DuckDB PARTITION_BY writes:
@@ -110,6 +121,12 @@ def flatten_index_partitions(scratch_dir: str, index_name: str) -> int:
 
     We flatten to:
       {index_name}/NL.parquet
+
+    Optional params for on-demand indexes (e.g. number_index) that are
+    queried via HTTP range requests instead of bulk-loaded into WASM:
+      row_group_size: small row groups enable row-group pushdown
+      bloom_filter_columns: bloom filters on lookup columns skip non-matching groups
+      sorting_columns: list of (column, "ascending"/"descending") for sort metadata
 
     Returns the number of country files created.
     """
@@ -129,15 +146,27 @@ def flatten_index_partitions(scratch_dir: str, index_name: str) -> int:
         dest = index_dir / f"{cc}.parquet"
         tables = [pq.read_table(str(f)) for f in parquet_files]
         combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-        pq.write_table(
-            combined,
-            str(dest),
-            compression="zstd",
-            compression_level=6,
-            version="2.6",
-            write_statistics=True,
-            write_page_index=True,
-        )
+
+        # Build sorting metadata if requested
+        sort_cols = None
+        if sorting_columns:
+            sort_cols = pq.SortingColumn.from_ordering(combined.schema, sorting_columns)
+
+        write_kwargs: dict = {
+            "compression": "zstd",
+            "compression_level": 6,
+            "version": "2.6",
+            "write_statistics": True,
+            "write_page_index": True,
+        }
+        if row_group_size is not None:
+            write_kwargs["row_group_size"] = row_group_size
+        if bloom_filter_columns:
+            write_kwargs["write_bloom_filter_for"] = bloom_filter_columns
+        if sort_cols is not None:
+            write_kwargs["sorting_columns"] = sort_cols
+
+        pq.write_table(combined, str(dest), **write_kwargs)
         shutil.rmtree(str(country_dir))
         count += 1
 
@@ -256,7 +285,16 @@ def export_and_upload(
     n_postcode = flatten_index_partitions(scratch_dir, "postcode_index")
     n_street = flatten_index_partitions(scratch_dir, "street_index")
     n_city = flatten_index_partitions(scratch_dir, "city_index")
-    n_number = flatten_index_partitions(scratch_dir, "number_index")
+    # number_index is queried on-demand via HTTP range requests (not bulk-loaded).
+    # Small row groups (2000) + bloom filters on street_lower enable DuckDB-WASM
+    # to fetch only ~100-150 KB per query instead of the full file (7-12 MB).
+    n_number = flatten_index_partitions(
+        scratch_dir,
+        "number_index",
+        row_group_size=2000,
+        bloom_filter_columns=["street_lower"],
+        sorting_columns=[("street_lower", "ascending")],
+    )
     log.info(
         "[GEOCODER] Index partitions: %d postcode + %d street + %d city + %d number countries",
         n_postcode,
