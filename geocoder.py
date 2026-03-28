@@ -244,6 +244,7 @@ def export_and_upload(
       - postcode_index/country=XX/           → postcode_index/XX.parquet
       - street_index/country=XX/             → street_index/XX.parquet
       - city_index/country=XX/               → city_index/XX.parquet
+      - number_index/country=XX/             → number_index/XX.parquet
     """
     t0 = time.time()
 
@@ -255,11 +256,13 @@ def export_and_upload(
     n_postcode = flatten_index_partitions(scratch_dir, "postcode_index")
     n_street = flatten_index_partitions(scratch_dir, "street_index")
     n_city = flatten_index_partitions(scratch_dir, "city_index")
+    n_number = flatten_index_partitions(scratch_dir, "number_index")
     log.info(
-        "[GEOCODER] Index partitions: %d postcode + %d street + %d city countries",
+        "[GEOCODER] Index partitions: %d postcode + %d street + %d city + %d number countries",
         n_postcode,
         n_street,
         n_city,
+        n_number,
     )
 
     # Upload everything in scratch_dir
