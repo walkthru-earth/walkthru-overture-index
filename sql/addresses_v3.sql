@@ -12,11 +12,13 @@
 --   Level 3: h3_parent (H3 res 4, ~1,770 km²)
 --
 --   Region source per country:
---     address_levels[1] where it maps to state/province (<100 distinct):
---       US(50), JP(47), BR(27), DE(15), AU(9), CA(13), IT(20),
---       MX(32), TW(16), CO(32), CL(16), DK(5), EE(15), SK(8),
---       SI(12), LV(42), UY(19), HK(3), FO(29), GL(78)
---     H3 res 2 hex for countries without state-level admin data:
+--     address_levels[1] for countries with ASCII-safe state codes:
+--       US(50), BR(27), AU(9), CA(13), CO(32), DE(15), GL(78),
+--       HK(3), UY(19)
+--     H3 res 2 hex for all others (non-ASCII chars in state names,
+--     or no state-level admin data):
+--       JP (kanji), TW (CJK), MX/CL (accents), IT (slashes),
+--       DK/EE/SK/SI/LV/FO (diacritics),
 --       FR, ES, NL, BE, PT, FI, NO, CH, CZ, RS, AT, NZ, PL,
 --       HR, LT, LU, IS, SG, LI, GB
 --
@@ -105,16 +107,16 @@ with_city_region AS (
             postal_city
         ) AS city,
         -- Region: always populated for v3 partitioning
-        -- Countries with state-level admin in address_levels[1] (depth>=2, <100 distinct):
-        --   Use the human-readable name (e.g. "California", "Tokyo", "SP")
-        -- Countries without (depth=1 or too granular):
+        -- S3 paths require ASCII-safe values (DuckDB httpfs does not
+        -- URL-encode non-ASCII characters in Hive partition paths).
+        -- Countries with ASCII-safe state codes in address_levels[1]:
+        --   US(50), BR(27), AU(9), CA(13), CO(32), DE(15), GL(78),
+        --   HK(3), UY(19) — use the name directly
+        -- All other countries (JP kanji, MX/CL accents, IT slashes, etc.):
         --   Use H3 res 2 hex as geographic proxy (~15-25 cells per country)
         CASE
             WHEN len(address_levels) >= 2
-                 AND country IN (
-                    'US','JP','BR','DE','AU','CA','IT','MX','TW',
-                    'CO','CL','DK','EE','SK','SI','LV','UY','HK','FO','GL'
-                 )
+                 AND country IN ('US','BR','AU','CA','CO','DE','GL','HK','UY')
             THEN address_levels[1].value
             ELSE h3_h3_to_string(h3_cell_to_parent(h3_latlng_to_cell(
                 ST_Y(geometry), ST_X(geometry), 4), 2))
