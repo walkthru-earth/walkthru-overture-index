@@ -280,6 +280,11 @@ def merge_split_partitions(scratch_dir: str) -> None:
     Re-writes with matching Parquet settings so bloom filters are regenerated
     (DuckDB auto-creates bloom filters on dict-encoded columns like street,
     city, postcode). ROW_GROUP_SIZE 25000 preserves spatial pushdown granularity.
+
+    GEOPARQUET_VERSION 'BOTH' preserves per-row-group geo_bbox metadata,
+    enabling ST_Intersects pushdown (skips row groups by bounding box).
+    Without it, spatial queries must scan every row. EXPLAIN ANALYZE showed
+    19 KiB vs 18 MiB downloaded for the same query.
     """
     scratch = Path(scratch_dir)
     split_dirs = [p.parent for p in scratch.rglob("data_1.parquet")]
@@ -291,6 +296,7 @@ def merge_split_partitions(scratch_dir: str) -> None:
     log.info("[MERGE] Found %d split partition(s), merging...", len(split_dirs))
     t0 = time.time()
     merge_con = duckdb.connect()
+    merge_con.load_extension("spatial")
 
     for d in split_dirs:
         parts = sorted(d.glob("data_*.parquet"))
@@ -299,13 +305,15 @@ def merge_split_partitions(scratch_dir: str) -> None:
 
         # number_index uses smaller row groups for narrow bloom filter ranges
         row_group_size = 2000 if "number_index" in str(d) else 25000
+        # geocoder tiles have geometry, need geo_bbox for spatial pushdown
+        geo_opt = ", GEOPARQUET_VERSION 'BOTH'" if "geocoder" in str(d) else ""
 
         glob_path = str(d / "data_*.parquet")
         merge_con.sql(
             f"COPY (FROM read_parquet('{glob_path}')) "
             f"TO '{merged}' (FORMAT PARQUET, PARQUET_VERSION v2, "
             f"COMPRESSION ZSTD, COMPRESSION_LEVEL 6, "
-            f"ROW_GROUP_SIZE {row_group_size})"
+            f"ROW_GROUP_SIZE {row_group_size}{geo_opt})"
         )
 
         for p in parts:
