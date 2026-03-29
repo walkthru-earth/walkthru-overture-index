@@ -109,14 +109,13 @@ with_city_region AS (
         -- Region: always populated for v3 partitioning
         -- S3 paths require ASCII-safe values (DuckDB httpfs does not
         -- URL-encode non-ASCII characters in Hive partition paths).
-        -- Countries with ASCII-safe state codes in address_levels[1]:
-        --   US(50), BR(27), AU(9), CA(13), CO(32), DE(15), GL(78),
-        --   HK(3), UY(19) — use the name directly
-        -- All other countries (JP kanji, MX/CL accents, IT slashes, etc.):
-        --   Use H3 res 2 hex as geographic proxy (~15-25 cells per country)
+        -- Countries with ASCII-safe, no-space state codes in address_levels[1]:
+        --   US(50), BR(27), AU(9), CA(13), CO(32), DE(15), HK(3)
+        -- Excluded: GL/UY have spaces in names (URL-encoded to %20, breaks httpfs)
+        -- All other countries: H3 res 2 hex as geographic proxy
         CASE
             WHEN len(address_levels) >= 2
-                 AND country IN ('US','BR','AU','CA','CO','DE','GL','HK','UY')
+                 AND country IN ('US','BR','AU','CA','CO','DE','HK')
             THEN address_levels[1].value
             ELSE h3_h3_to_string(h3_cell_to_parent(h3_latlng_to_cell(
                 ST_Y(geometry), ST_X(geometry), 4), 2))
