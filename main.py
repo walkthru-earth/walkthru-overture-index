@@ -297,12 +297,15 @@ def merge_split_partitions(scratch_dir: str) -> None:
         total_before = sum(p.stat().st_size for p in parts)
         merged = d / "_merged.parquet"
 
+        # number_index uses smaller row groups for narrow bloom filter ranges
+        row_group_size = 2000 if "number_index" in str(d) else 25000
+
         glob_path = str(d / "data_*.parquet")
         merge_con.sql(
             f"COPY (FROM read_parquet('{glob_path}')) "
             f"TO '{merged}' (FORMAT PARQUET, PARQUET_VERSION v2, "
             f"COMPRESSION ZSTD, COMPRESSION_LEVEL 6, "
-            f"ROW_GROUP_SIZE 25000)"
+            f"ROW_GROUP_SIZE {row_group_size})"
         )
 
         for p in parts:
