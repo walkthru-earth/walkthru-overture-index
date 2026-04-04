@@ -46,7 +46,6 @@ INDEX_BUILDERS: dict[str, str] = {
     "places": "sql/places.sql",
     "buildings": "sql/buildings.sql",
     "addresses": "sql/addresses.sql",
-    "addresses_v3": "sql/addresses_v3.sql",
     "addresses_v4": "sql/addresses_v4.sql",
     "base": "sql/base.sql",
 }
@@ -546,8 +545,6 @@ def main() -> None:
         # directly via httpfs (17K+ files = 51K+ HTTP round-trips).
         if theme == "addresses_v4":
             s3_dest = f"{s3_base}/addresses-index/v4/release={release}"
-        elif theme == "addresses_v3":
-            s3_dest = f"{s3_base}/addresses-index/v3/release={release}"
         elif theme == "addresses":
             s3_dest = f"{s3_base}/{theme}-index/v2/release={release}"
         else:

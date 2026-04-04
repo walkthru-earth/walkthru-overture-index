@@ -145,7 +145,7 @@
 --         text-partitioned. The street_index already narrowed
 --         to the right h3_res4. Within each bucket, street
 --         pushdown skips to the right row group.)
---     5. Fetch bucket file(s) -> WHERE lower(street) = X
+--     5. Fetch bucket file(s) -> WHERE street_lower = X
 --        -> min/max pushdown -> 1 row group (~100 KB)
 --     6. For street+number: number_index via HTTP range request
 --
@@ -359,6 +359,15 @@ FROM (
 --   - Reverse geocoding: client can filter by h3_index after
 --     full scan for extra precision within a bucket
 --   - Future use: if DuckDB-WASM adds secondary index support
+--
+-- street_lower (added in v4.1): pre-computed lower(street) as a
+-- physical column. DuckDB-WASM queries filter on street_lower
+-- instead of lower(street) so Parquet row-group min/max stats
+-- can push down the filter. Without this, lower() applied at
+-- query time defeats pushdown because DuckDB can't apply
+-- functions to stored statistics. With street_lower, a query
+-- like WHERE street_lower LIKE 'via cave%' checks the row
+-- group min/max directly, skipping ~95% of row groups.
 
 .print '>>> Step 3: Exporting geocoder tiles (street-sorted, bucketed)...'
 
@@ -366,7 +375,8 @@ COPY (
     SELECT
         country, h3_res4, bucket,
         geometry, postcode, street, number, unit,
-        city, region, full_address, h3_index
+        city, region, full_address, h3_index,
+        lower(street) AS street_lower
     FROM _bucketed
     ORDER BY country, h3_res4, bucket, lower(street), number
 ) TO (getvariable('output_dir') || '/geocoder/')
