@@ -47,6 +47,7 @@ INDEX_BUILDERS: dict[str, str] = {
     "buildings": "sql/buildings.sql",
     "addresses": "sql/addresses.sql",
     "addresses_v3": "sql/addresses_v3.sql",
+    "addresses_v4": "sql/addresses_v4.sql",
     "base": "sql/base.sql",
 }
 
@@ -279,12 +280,19 @@ def merge_split_partitions(scratch_dir: str) -> None:
 
     Re-writes with matching Parquet settings so bloom filters are regenerated
     (DuckDB auto-creates bloom filters on dict-encoded columns like street,
-    city, postcode). ROW_GROUP_SIZE 25000 preserves spatial pushdown granularity.
+    city, postcode).
+
+    IMPORTANT: The merge reads split files WITHOUT an explicit ORDER BY.
+    Sort order is preserved because read_parquet reads files in name order
+    (data_0, data_1, ...) and DuckDB's partitioned writer writes each
+    partition's rows contiguously in the ORDER BY sequence from the COPY.
+    This matters for v4 geocoder tiles which are street-sorted for forward
+    geocoding pushdown. Do NOT add random shuffling or parallel reads here.
+
+    ROW_GROUP_SIZE varies by index type (see inline comments).
 
     GEOPARQUET_VERSION 'BOTH' preserves per-row-group geo_bbox metadata,
-    enabling ST_Intersects pushdown (skips row groups by bounding box).
-    Without it, spatial queries must scan every row. EXPLAIN ANALYZE showed
-    19 KiB vs 18 MiB downloaded for the same query.
+    enabling spatial pushdown (skips row groups by bounding box).
     """
     scratch = Path(scratch_dir)
     split_dirs = [p.parent for p in scratch.rglob("data_1.parquet")]
@@ -303,10 +311,21 @@ def merge_split_partitions(scratch_dir: str) -> None:
         total_before = sum(p.stat().st_size for p in parts)
         merged = d / "_merged.parquet"
 
-        # number_index uses smaller row groups for narrow bloom filter ranges
-        row_group_size = 2000 if "number_index" in str(d) else 25000
+        # ROW_GROUP_SIZE per index type:
+        #   number_index: 2000 (narrow street_lower ranges for bloom filter pushdown)
+        #   geocoder (v4): 10000 (street-sorted, ~200 streets per group for tight
+        #                  min/max pushdown on forward geocoding queries)
+        #   geocoder (v1-v3): 25000 (h3-sorted, balanced spatial pushdown)
+        #   other indexes: 25000
+        d_str = str(d)
+        if "number_index" in d_str:
+            row_group_size = 2000
+        elif "geocoder" in d_str and "addresses_v4" in d_str:
+            row_group_size = 10000
+        else:
+            row_group_size = 25000
         # geocoder tiles have geometry, need geo_bbox for spatial pushdown
-        geo_opt = ", GEOPARQUET_VERSION 'BOTH'" if "geocoder" in str(d) else ""
+        geo_opt = ", GEOPARQUET_VERSION 'BOTH'" if "geocoder" in d_str else ""
 
         glob_path = str(d / "data_*.parquet")
         merge_con.sql(
@@ -525,7 +544,9 @@ def main() -> None:
         # DuckDB writes to local disk (fast NVMe), then s5cmd uploads
         # in parallel. This is 5-10x faster than DuckDB writing to S3
         # directly via httpfs (17K+ files = 51K+ HTTP round-trips).
-        if theme == "addresses_v3":
+        if theme == "addresses_v4":
+            s3_dest = f"{s3_base}/addresses-index/v4/release={release}"
+        elif theme == "addresses_v3":
             s3_dest = f"{s3_base}/addresses-index/v3/release={release}"
         elif theme == "addresses":
             s3_dest = f"{s3_base}/{theme}-index/v2/release={release}"
