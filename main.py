@@ -42,12 +42,11 @@ OVERTURE_REGION = "us-west-2"
 STAC_CATALOG = "https://labs.overturemaps.org/stac/catalog.json"
 
 INDEX_BUILDERS: dict[str, str] = {
-    "transportation": "sql/transportation.sql",
-    "places": "sql/places.sql",
-    "buildings": "sql/buildings.sql",
-    "addresses": "sql/addresses.sql",
-    "addresses_v4": "sql/addresses_v4.sql",
-    "base": "sql/base.sql",
+    "addresses": "sql/v4/addresses.sql",
+    "places": "sql/v1/places.sql",
+    "transportation": "sql/v1/transportation.sql",
+    "base": "sql/v1/base.sql",
+    "buildings": "sql/v1/buildings.sql",
 }
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
@@ -130,6 +129,11 @@ def get_duckdb() -> duckdb.DuckDBPyConnection:
 
     con.sql("SET preserve_insertion_order = false")
     con.sql("SET temp_directory = 'duckdb_temp.tmp'")
+
+    # Transient S3 read timeouts (e.g. the 140s HTTP timeout we saw
+    # on base/land_use) should retry, not fail the whole theme.
+    con.sql("SET http_retries = 5")
+    con.sql("SET http_retry_backoff = 4")
 
     # Memory management: cap at 80% of system RAM so OS keeps enough
     # for networking, DNS, page cache. DuckDB spills to temp_directory.
@@ -312,14 +316,14 @@ def merge_split_partitions(scratch_dir: str) -> None:
 
         # ROW_GROUP_SIZE per index type:
         #   number_index: 2000 (narrow street_lower ranges for bloom filter pushdown)
-        #   geocoder (v4): 10000 (street-sorted, ~200 streets per group for tight
-        #                  min/max pushdown on forward geocoding queries)
-        #   geocoder (v1-v3): 25000 (h3-sorted, balanced spatial pushdown)
+        #   geocoder: 10000 (v4 is the only active geocoder, street-sorted,
+        #             ~200 streets per group for tight min/max pushdown on
+        #             forward geocoding queries)
         #   other indexes: 25000
         d_str = str(d)
         if "number_index" in d_str:
             row_group_size = 2000
-        elif "geocoder" in d_str and "addresses_v4" in d_str:
+        elif "geocoder" in d_str:
             row_group_size = 10000
         else:
             row_group_size = 25000
@@ -459,12 +463,16 @@ def run_sql(con: duckdb.DuckDBPyConnection, sql_file: str, theme: str) -> None:
 
 
 def _cleanup_disk() -> None:
-    """Remove DuckDB temp files and log disk space."""
+    """Log disk space. Do NOT delete duckdb_temp.tmp — the shared
+    DuckDB connection still points at that path (SET temp_directory
+    happens once at connect time), so removing it between themes
+    caused buildings to fail mid-query with
+    "Cannot open file duckdb_temp.tmp/duckdb_temp_storage_...tmp".
+    DuckDB manages its own spill files inside that dir."""
     temp_dir = Path("duckdb_temp.tmp")
     if temp_dir.exists():
         sz = sum(f.stat().st_size for f in temp_dir.rglob("*") if f.is_file())
-        shutil.rmtree(str(temp_dir), ignore_errors=True)
-        log.info("[CLEANUP] Removed duckdb_temp.tmp (%.1f GB)", sz / 1e9)
+        log.info("[CLEANUP] duckdb_temp.tmp (%.1f GB, retained)", sz / 1e9)
 
     try:
         total, used, free = shutil.disk_usage(".")
@@ -543,12 +551,14 @@ def main() -> None:
         # DuckDB writes to local disk (fast NVMe), then s5cmd uploads
         # in parallel. This is 5-10x faster than DuckDB writing to S3
         # directly via httpfs (17K+ files = 51K+ HTTP round-trips).
-        if theme == "addresses_v4":
-            s3_dest = f"{s3_base}/addresses-index/v4/release={release}"
-        elif theme == "addresses":
-            s3_dest = f"{s3_base}/{theme}-index/v2/release={release}"
+        # Version is derived from the SQL file's parent directory
+        # (sql/v1/*.sql → v1, sql/v4/*.sql → v4). Non-address themes
+        # keep the /h3 suffix so existing release URLs stay stable.
+        version = Path(sql_file).parent.name
+        if theme == "addresses":
+            s3_dest = f"{s3_base}/{theme}-index/{version}/release={release}"
         else:
-            s3_dest = f"{s3_base}/{theme}-index/v1/release={release}/h3"
+            s3_dest = f"{s3_base}/{theme}-index/{version}/release={release}/h3"
 
         # Local scratch: use ./scratch/<theme> (NVMe, not tmpfs)
         scratch_dir = Path("scratch") / theme
@@ -561,6 +571,15 @@ def main() -> None:
         if not s3_base:
             local_out = str(Path("output").resolve())
             Path(local_out).mkdir(parents=True, exist_ok=True)
+
+        # Pre-create h3_res=1..10 subdirs. DuckDB's single-file
+        # COPY TO ('path/h3_res=10/data.parquet') does not create
+        # parent directories, so the first write would fail with
+        # "Cannot open file ... No such file or directory".
+        # Address themes use PARTITION_BY and don't need these.
+        if theme != "addresses":
+            for res in range(1, 11):
+                (Path(local_out) / f"h3_res={res}").mkdir(exist_ok=True)
 
         con.sql(f"SET VARIABLE overture_release = '{release}'")
         con.sql(f"SET VARIABLE output_dir = '{local_out}'")
