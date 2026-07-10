@@ -24,7 +24,7 @@ jobs:
       - name: Check latest Overture release via STAC
         id: check
         run: |
-          LATEST=$(curl -s https://labs.overturemaps.org/stac/catalog.json \
+          LATEST=$(curl -sL https://stac.overturemaps.org/catalog.json \
             | python3 -c "
           import json, sys
           cat = json.load(sys.stdin)

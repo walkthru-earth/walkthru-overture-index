@@ -39,7 +39,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 OVERTURE_REGION = "us-west-2"
-STAC_CATALOG = "https://labs.overturemaps.org/stac/catalog.json"
+STAC_CATALOG = "https://stac.overturemaps.org/catalog.json"
 
 INDEX_BUILDERS: dict[str, str] = {
     "addresses": "sql/v4/addresses.sql",
