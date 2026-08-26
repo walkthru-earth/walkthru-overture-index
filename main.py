@@ -21,12 +21,14 @@ import json
 import logging
 import os
 import platform
+import re
 import resource
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import duckdb
@@ -40,6 +42,9 @@ log = logging.getLogger(__name__)
 
 OVERTURE_REGION = "us-west-2"
 STAC_CATALOG = "https://stac.overturemaps.org/catalog.json"
+
+# Overture release versions look like 2026-08-19.0
+RELEASE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.\d+$")
 
 INDEX_BUILDERS: dict[str, str] = {
     "addresses": "sql/v4/addresses.sql",
@@ -97,6 +102,17 @@ def _log_system_info() -> None:
     log.info("=" * 60)
 
 
+def _release_from_href(href: str) -> str:
+    """Extract the release version from a STAC child catalog href.
+
+    Overture serves absolute hrefs (https://stac.overturemaps.org/2026-08-19.0/
+    catalog.json), so the version is the second-to-last path segment. Relative
+    hrefs (./2026-08-19.0/catalog.json) resolve the same way.
+    """
+    parts = [p for p in urlparse(href).path.split("/") if p not in ("", ".", "..")]
+    return parts[-2] if len(parts) >= 2 else ""
+
+
 def detect_latest_release() -> str:
     """Query Overture STAC catalog for the latest release version."""
     log.info("[STAC] Querying %s", STAC_CATALOG)
@@ -105,21 +121,40 @@ def detect_latest_release() -> str:
         catalog = json.loads(resp.read())
     log.info("[STAC] Catalog fetched in %.1fs", time.time() - t0)
 
-    for link in catalog.get("links", []):
-        if link.get("rel") == "child":
-            title = link.get("title", "")
-            if "latest" in title.lower():
-                version = link["href"].split("/")[1]
-                log.info("[STAC] Latest release: %s", version)
-                return version
+    candidates: list[tuple[str, str]] = []
 
-    children = [lnk for lnk in catalog.get("links", []) if lnk.get("rel") == "child"]
-    if children:
-        version = children[0]["href"].split("/")[1]
-        log.info("[STAC] Latest release (fallback): %s", version)
-        return version
+    # Preferred: the catalog states the latest release outright.
+    top_level = str(catalog.get("latest", "") or "")
+    if top_level:
+        candidates.append(("latest key", top_level))
 
-    raise RuntimeError("No releases found in STAC catalog")
+    links = catalog.get("links", [])
+    children = [lnk for lnk in links if lnk.get("rel") == "child"]
+
+    # Next: the child link flagged latest, either by the "latest" flag or its title.
+    for link in children:
+        if link.get("latest") is True or "latest" in str(link.get("title", "")).lower():
+            candidates.append(("latest link", _release_from_href(link.get("href", ""))))
+            break
+
+    # Last resort: newest-looking child link.
+    versions = sorted(
+        v
+        for v in (_release_from_href(lnk.get("href", "")) for lnk in children)
+        if RELEASE_RE.match(v)
+    )
+    if versions:
+        candidates.append(("newest child", versions[-1]))
+
+    for source, version in candidates:
+        if RELEASE_RE.match(version):
+            log.info("[STAC] Latest release: %s (via %s)", version, source)
+            return version
+        log.warning("[STAC] Ignoring unusable %s value: %r", source, version)
+
+    raise RuntimeError(
+        f"Could not determine latest release from STAC catalog {STAC_CATALOG}"
+    )
 
 
 def get_duckdb() -> duckdb.DuckDBPyConnection:
@@ -496,7 +531,12 @@ def main() -> None:
 
     _log_system_info()
 
-    release = args.release or detect_latest_release()
+    release = (args.release or "").strip() or detect_latest_release()
+    if not RELEASE_RE.match(release):
+        raise SystemExit(
+            f"[FATAL] Invalid Overture release {release!r}. "
+            "Expected a version like 2026-08-19.0"
+        )
     themes = [t.strip() for t in args.themes.split(",")]
 
     log.info("[PLAN] Release: %s", release)
@@ -643,9 +683,11 @@ def main() -> None:
             log.info("[CLEANUP] Removed scratch/%s (%.1f GB)", theme, sz / 1e9)
         _cleanup_disk()
 
-    # Save state
-    Path("state").mkdir(exist_ok=True)
-    Path("state/last-release.txt").write_text(release + "\n")
+    # Save state only on a clean run. A partial build must not record the
+    # release as done, or the next detect-release skips it forever.
+    if not failed:
+        Path("state").mkdir(exist_ok=True)
+        Path("state/last-release.txt").write_text(release + "\n")
 
     # Final summary
     total_elapsed = time.time() - pipeline_t0

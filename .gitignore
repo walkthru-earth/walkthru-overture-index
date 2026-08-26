@@ -7,3 +7,4 @@ duckdb_temp.tmp/
 docs/
 _study/
 frontend/
+.DS_Store

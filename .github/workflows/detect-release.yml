@@ -15,7 +15,7 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       actions: write
 
     steps:
@@ -24,17 +24,54 @@ jobs:
       - name: Check latest Overture release via STAC
         id: check
         run: |
-          LATEST=$(curl -sL https://stac.overturemaps.org/catalog.json \
-            | python3 -c "
-          import json, sys
-          cat = json.load(sys.stdin)
-          for link in cat.get('links', []):
-              if link.get('rel') == 'child' and 'latest' in link.get('title', '').lower():
-                  print(link['href'].split('/')[1])
-                  break
-          ")
+          set -euo pipefail
 
-          LAST=$(cat state/last-release.txt 2>/dev/null | tr -d '[:space:]')
+          CATALOG=$(curl -sS --fail --location --retry 5 --retry-delay 10 \
+            --retry-all-errors --max-time 60 \
+            https://stac.overturemaps.org/catalog.json)
+
+          LATEST=$(printf '%s' "$CATALOG" | python3 -c '
+          import json, re, sys
+          from urllib.parse import urlparse
+
+          RELEASE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.\d+$")
+
+
+          def version_from_href(href):
+              # Hrefs are absolute (https://stac.overturemaps.org/2026-08-19.0/catalog.json)
+              # so the version is the second-to-last path segment.
+              parts = [p for p in urlparse(href).path.split("/") if p not in ("", ".", "..")]
+              return parts[-2] if len(parts) >= 2 else ""
+
+
+          catalog = json.load(sys.stdin)
+          children = [l for l in catalog.get("links", []) if l.get("rel") == "child"]
+
+          candidates = [str(catalog.get("latest", "") or "")]
+          candidates += [
+              version_from_href(l.get("href", ""))
+              for l in children
+              if l.get("latest") is True or "latest" in str(l.get("title", "")).lower()
+          ]
+          candidates += sorted(
+              v for v in (version_from_href(l.get("href", "")) for l in children)
+              if RELEASE_RE.match(v)
+          )[-1:]
+
+          for version in candidates:
+              if RELEASE_RE.match(version):
+                  print(version)
+                  break
+          else:
+              sys.exit("Could not determine latest release from STAC catalog")
+          ')
+
+          if ! printf '%s' "$LATEST" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$'; then
+            echo "::error::Unusable release version from STAC: '$LATEST'"
+            exit 1
+          fi
+
+          LAST=$(tr -d '[:space:]' < state/last-release.txt 2>/dev/null || true)
           echo "Latest:    $LATEST"
           echo "Last seen: $LAST"
           echo "latest=$LATEST" >> $GITHUB_OUTPUT
@@ -47,19 +84,29 @@ jobs:
             echo "New release detected!"
           fi
 
-      - name: Update state file
+      # state/last-release.txt is written by build-index.yml only after a
+      # successful build, so a failed release is retried on the next run
+      # instead of being silently recorded as done.
+      - name: Skip if a build is already running
+        id: inflight
         if: steps.check.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "${{ steps.check.outputs.latest }}" > state/last-release.txt
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state/last-release.txt
-          git diff --cached --quiet && exit 0
-          git commit -m "chore: update Overture last-seen to ${{ steps.check.outputs.latest }} [skip ci]"
-          git push
+          set -euo pipefail
+          ACTIVE=$(gh run list --workflow build-index.yml --limit 20 \
+            --json status \
+            --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
+          echo "Active build runs: $ACTIVE"
+          if [ "$ACTIVE" -gt 0 ]; then
+            echo "::notice::A build-index run is already active, not dispatching another."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Trigger build pipeline
-        if: steps.check.outputs.new == 'true'
+        if: steps.check.outputs.new == 'true' && steps.inflight.outputs.skip == 'false'
         run: |
           gh workflow run build-index.yml \
             --field release="${{ steps.check.outputs.latest }}" \
