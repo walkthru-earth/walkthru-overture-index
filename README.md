@@ -62,7 +62,7 @@ All files: Parquet v2, ZSTD compression, sorted by `h3_index` (BIGINT), no geome
 Two GitHub Actions workflows:
 
 1. **detect-release.yml** — Polls Overture STAC catalog daily. On new release, triggers the build.
-2. **build-index.yml** — Spins up a Hetzner Cloud runner (default `ccx63`: 48 vCPU, 192 GB RAM), runs all 5 indices sequentially (~30 min), tears down.
+2. **build-index.yml** — Spins up a Hetzner Cloud runner (default `ccx63`: 48 vCPU, 192 GB RAM), checks source query compatibility, runs all 5 indices sequentially, then tears down. Failed builds remain unrecorded and are retried by the daily detector.
 
 ### Secrets needed
 

@@ -147,7 +147,7 @@ walkthru-earth/indices/
 | `place_count` | Total POIs |
 | `avg_confidence` | Weighted average confidence (0-1) |
 | `n_food_and_drink` .. `n_geographic_entities` | 13 top categories (from `taxonomy.hierarchy[1]`) |
-| `n_restaurant` .. `n_school` | 15 subcategories (from `categories.primary`) |
+| `n_restaurant` .. `n_school` | 15 leaf categories (from `taxonomy.primary`) |
 
 ### Transportation (27 columns)
 

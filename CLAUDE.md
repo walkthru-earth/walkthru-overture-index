@@ -37,9 +37,9 @@ CREATE SECRET output_s3 (TYPE S3, KEY_ID '...', SECRET '...', REGION 'us-west-2'
 - **Set `temp_directory`** so DuckDB can spill to disk when hitting the memory limit.
 - `_mem_gb()` reports peak RSS (high-water mark) — it never decreases even after `DROP TABLE`. DuckDB does free memory internally.
 
-### Overture Maps schema (2026-03-18.0)
+### Overture Maps schema
 
-- **Places `categories.primary`** contains **leaf-level** categories (`restaurant`, `cafe`, `hotel`), NOT top-level ones. Top-level categories (`food_and_drink`, `shopping`) come from **`taxonomy.hierarchy[1]`** (1-indexed array).
+- **Places schema v2.0.0 (2026-09-23.0+) removed `categories`**. Use `taxonomy.primary` for leaf-level categories (`restaurant`, `cafe`, `hotel`). Top-level categories (`food_and_drink`, `shopping`) come from **`taxonomy.hierarchy[1]`** (1-indexed array).
 - **Addresses** column is `postcode`, not `postal_code`.
 - **`road_flags`** is `STRUCT("values" VARCHAR[], "between" DOUBLE[])[]` — use `road_flags::VARCHAR LIKE '%is_bridge%'` to check flags, not `list_contains()`.
 - **`road_surface`** access: `road_surface[1].value` (1-indexed).

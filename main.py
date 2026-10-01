@@ -78,8 +78,8 @@ def _log_system_info() -> None:
         import multiprocessing
 
         log.info("CPUs:   %d", multiprocessing.cpu_count())
-    except Exception:
-        pass
+    except (NotImplementedError, OSError):
+        log.debug("CPU count unavailable")
 
     try:
         with open("/proc/meminfo") as f:
@@ -94,10 +94,10 @@ def _log_system_info() -> None:
     try:
         import shutil
 
-        total, used, free = shutil.disk_usage(".")
+        total, _, free = shutil.disk_usage(".")
         log.info("Disk:   %.1f GB free / %.1f GB total", free / 1e9, total / 1e9)
-    except Exception:
-        pass
+    except OSError:
+        log.debug("Disk usage unavailable")
 
     log.info("=" * 60)
 
@@ -193,7 +193,7 @@ def get_duckdb() -> duckdb.DuckDBPyConnection:
     for ext in ("spatial", "httpfs"):
         try:
             con.load_extension(ext)
-        except Exception:
+        except duckdb.Error:
             log.info("[DUCKDB] Installing extension '%s'...", ext)
             con.install_extension(ext)
             con.load_extension(ext)
@@ -201,7 +201,7 @@ def get_duckdb() -> duckdb.DuckDBPyConnection:
 
     try:
         con.load_extension("h3")
-    except Exception:
+    except duckdb.Error:
         log.info("[DUCKDB] Installing extension 'h3' from community...")
         con.install_extension("h3", repository="community")
         con.load_extension("h3")
@@ -277,6 +277,7 @@ def s5cmd_upload(local_dir: str, s3_dest: str) -> None:
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             log.error("[UPLOAD] s5cmd stderr: %s", result.stderr[:500])
@@ -294,6 +295,7 @@ def s5cmd_upload(local_dir: str, s3_dest: str) -> None:
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             log.error("[UPLOAD] aws sync stderr: %s", result.stderr[:500])
@@ -497,6 +499,47 @@ def run_sql(con: duckdb.DuckDBPyConnection, sql_file: str, theme: str) -> None:
             raise
 
 
+def preflight_source_schemas(
+    con: duckdb.DuckDBPyConnection, release: str, themes: list[str]
+) -> None:
+    """Bind source-reading SQL before any large scan or upload.
+
+    EXPLAIN resolves Parquet column names without executing the CREATE TABLE.
+    This catches removed fields, such as Places categories.primary in schema 2.0,
+    before a failed release spends hours rebuilding the other themes.
+    """
+    con.sql(
+        "SET VARIABLE overture_source = "
+        f"'s3://overturemaps-us-west-2/release/{release}'"
+    )
+    for theme in themes:
+        sql_file = INDEX_BUILDERS.get(theme)
+        if not sql_file or not Path(sql_file).exists():
+            continue
+        sql = Path(sql_file).read_text()
+        checked = 0
+        for chunk in sql.split(";"):
+            statement = "\n".join(
+                line
+                for line in chunk.splitlines()
+                if not line.lstrip().startswith(("--", ".print"))
+            ).strip()
+            if not statement.upper().startswith("CREATE"):
+                continue
+            if not re.search(r"\bFROM\s+read_parquet\s*\(", statement, re.IGNORECASE):
+                continue
+            try:
+                con.sql("EXPLAIN " + statement).fetchall()
+            except duckdb.Error as exc:
+                raise RuntimeError(
+                    f"{theme} source schema is incompatible with release {release}: {exc}"
+                ) from exc
+            checked += 1
+        if checked == 0:
+            raise RuntimeError(f"No source queries found for {theme} in {sql_file}")
+        log.info("[PREFLIGHT] %s: %d source query schema(s) OK", theme, checked)
+
+
 def _cleanup_disk() -> None:
     """Log disk space. Do NOT delete duckdb_temp.tmp — the shared
     DuckDB connection still points at that path (SET temp_directory
@@ -510,12 +553,12 @@ def _cleanup_disk() -> None:
         log.info("[CLEANUP] duckdb_temp.tmp (%.1f GB, retained)", sz / 1e9)
 
     try:
-        total, used, free = shutil.disk_usage(".")
+        total, _, free = shutil.disk_usage(".")
         log.info(
             "[CLEANUP] Disk: %.1f GB free / %.1f GB total", free / 1e9, total / 1e9
         )
-    except Exception:
-        pass
+    except OSError:
+        log.debug("Disk usage unavailable during cleanup")
 
 
 def main() -> None:
@@ -552,6 +595,9 @@ def main() -> None:
     con = get_duckdb()
     s3_base = configure_output(con)
 
+    # Catch upstream schema breaks before processing hundreds of millions of rows.
+    preflight_source_schemas(con, release, themes)
+
     # Smoke-test the upload path before DuckDB does any heavy work.
     # Writes a tiny .txt to S3 so we fail fast on bad credentials,
     # missing s5cmd/aws-cli, or wrong bucket permissions.
@@ -565,7 +611,7 @@ def main() -> None:
         try:
             s5cmd_upload(str(preflight_dir.resolve()), s3_base)
             log.info("[PREFLIGHT] Upload OK")
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             log.error("[PREFLIGHT] Upload FAILED: %s", e)
             log.error("[PREFLIGHT] Fix credentials or install s5cmd before continuing.")
             shutil.rmtree(str(preflight_dir), ignore_errors=True)
@@ -666,7 +712,7 @@ def main() -> None:
                 _mem_gb(),
             )
             completed.append(theme)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - keep processing other themes
             elapsed = time.time() - theme_t0
             log.error(
                 "[FAIL] %s failed after %.1f min: %s",
